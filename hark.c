@@ -1261,8 +1261,15 @@ static int set_option(Config *c, Json **owned, Json *history, char **sys, char *
     if (!*value) { if (old) { char *text = jdump(old); host_print(text); puts(""); free(text); } else fputs("unknown or unset option\n", stderr); jfree(j); return old != NULL; }
     if (!strcmp(key, "version") || !strcmp(key, "history") || !strcmp(key, "latest_user")) { jfree(j); fputs("use /context or /import for conversation context\n", stderr); return 0; }
     v = jparse(value); if (!v) v = jstr(value);
-    /* Pin a relative credential path now, so a later /set cwd cannot move it. */
+    /* Resolve relative user-file paths now, so a later /set cwd cannot move them.
+     * instruction_files stay relative: they name files in each working directory. */
     if (!strcmp(key, "auth_file") && v->type == J_STR && *v->s && !is_absolute(v->s)) { char *abs = absolute_path(v->s); jfree(v); v = jstr(abs); free(abs); }
+    if (!strcmp(key, "system_files")) {
+        Json *item, *list = v->type == J_STR ? NULL : v;
+        if (v->type == J_STR) { list = jnew(J_ARR); jadd(list, v); v = list; } /* One item needs no array. */
+        for (item = list->type == J_ARR ? list->child : NULL; item; item = item->next)
+            if (item->type == J_STR && *item->s && !is_absolute(item->s)) { char *abs = absolute_path(item->s); free(item->s); item->s = abs; }
+    }
     if ((!strcmp(key, "base_url") || !strcmp(key, "api") || !strcmp(key, "key_env"))) jset(j, "chatgpt", jbool(0));
     if (v->type == J_NULL || (v->type == J_STR && !strcmp(v->s, "default") && (!strcmp(key, "review_base_url") || !strcmp(key, "review_api") || !strcmp(key, "key_env") || !strcmp(key, "review_key_env") || !strcmp(key, "system")))) {
         remove_key(j, key); jfree(v);
@@ -1315,7 +1322,7 @@ int main(int argc, char **argv) {
     char *rc_path, *rc_text, *file_prompt = NULL, *path = NULL, *sys, *line, *latest = NULL, *selected_model = NULL, *selected_review_model = NULL;
     const char *initial_prompt, *initial_prompt_file; const char *includes[MAX_RULES], *contexts[MAX_RULES]; size_t ninclude, ncontext, include_index = 0;
     int login, ok = 1, prompt_pending, startup = 1, root_done = 0, list_on_start, interrupted = 0;
-    Json *resumed = NULL;
+    Json *resumed = NULL; char *pinned[MAX_RULES]; size_t npinned = 0;
     Inputs inputs; memset(&inputs, 0, sizeof inputs);
     rc_text = preload(argc, argv, &rc_path);
     options(&c, argc, argv, &login, NULL, 1); c.rc_file = rc_path;
@@ -1325,6 +1332,8 @@ int main(int argc, char **argv) {
     host_interrupt_arm();
     /* Credentials are never resolved inside --cwd, which may be an untrusted checkout. */
     if (c.auth_file && !is_absolute(c.auth_file)) { path = path_from(launch_dir, c.auth_file); c.auth_file = path; }
+    /* Like /set, --system-file is resolved now (from --cwd), so a later cwd change keeps it. */
+    { size_t i; for (i = 0; i < c.nsystem; i++) if (!is_absolute(c.system_files[i])) c.system_files[i] = pinned[npinned++] = absolute_path(c.system_files[i]); }
     if (!c.auth_file) {
         path = user_file(HOST_DATA, "auth.json", ".hark-auth.json"); c.auth_file = path;
         if (login && path) { char *data = host_dir(HOST_DATA); if (data && host_exists(path) == 0 && !host_mkdirs(data)) die("cannot create the hark data directory"); free(data); }
@@ -1390,7 +1399,8 @@ int main(int argc, char **argv) {
                 /* Isocline reads ^C as a key (cancel the line) and ^D on an empty line as EOF. */
                 char label[32]; context_label(&c, label, sizeof label);
                 if (interactive && !c.no_line_edit) { puts(""); host_interrupt_disarm(); line = line_read(label); host_interrupt_arm(); }
-                else { if (interactive) { printf("\n%s> ", label); fflush(stdout); } line = read_line(stdin); }
+                /* Flush first: a program driving Hark through pipes waits for this output. */
+                else { if (interactive) printf("\n%s> ", label); fflush(stdout); line = read_line(stdin); }
             }
             if (!line && host_interrupted()) continue;
             if (!line) break;
@@ -1528,5 +1538,6 @@ done:
     if (session_saved() && host_tty()) fputs("[saved; continue here with: hark resume]\n", stderr);
     session_end(); jfree(resumed); stop_jobs();
     inputs_close(&inputs); jfree(owned); store_close(); free(rc_path); free(file_prompt); free(launch_dir);
+    while (npinned) free(pinned[--npinned]);
     free(selected_review_model); free(selected_model); free(latest); free(sys); jfree(history); auth_free(&auth); free(path); curl_global_cleanup(); return interrupted ? 130 : ok ? 0 : 1;
 }

@@ -71,10 +71,11 @@ def test_local():
         saved_file = work / 'saved.hark'
         saved = rc_state(saved_file)
         for key, value in config.items():
-            if key not in ('version', 'cwd', 'auth_file', 'prompt_file', 'context_files'):
+            if key not in ('version', 'cwd', 'auth_file', 'system_files', 'prompt_file', 'context_files'):
                 assert saved[key] == value, (key, saved)
         # A relative auth_file is fixed to the directory current when it was set.
         assert saved['cwd'] == str(work) and saved['auth_file'] == str(work / 'auth.json')
+        assert saved['system_files'] == [str(work / 'system.txt')]
         assert [v['content'] for v in saved['history']] == [(work / 'notes.txt').read_text()]
         assert 'prompt_file' not in saved and 'context_files' not in saved and 'prompt' not in saved
         assert 'secret-not-saved' not in saved_file.read_text() and 'review-secret' not in saved_file.read_text()
@@ -365,9 +366,20 @@ def test_bad_settings():
         lines = p.stdout.splitlines()
         assert 'model: 7' in lines and lines[:2] == ['300', 'true'], p.stdout
         assert p.returncode == 1, 'a rejected command still makes a scripted run fail'
-        # A rejected /set cwd leaves the working directory where it was.
+        # A relative system file is pinned when set, so /set cwd keeps it working.
         invoke(text=f'/set system_files ["rel.txt"]\n/set cwd {other}\n/export out.json\n')
-        assert (start / 'out.json').exists() and not (other / 'out.json').exists()
+        assert (other / 'out.json').exists()
+        # A /set cwd that fails after changing directory (here, the pinned system file
+        # vanished) is rejected and leaves the working directory where it was.
+        p = subprocess.Popen([BINARY], cwd=start, env=environment(root), text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            p.stdin.write('/set system_files ["rel.txt"]\n/set system_files\n'); p.stdin.flush()
+            assert str(start / 'rel.txt') in p.stdout.readline()
+            (start / 'rel.txt').unlink()
+            out, err = p.communicate(f'/set cwd {other}\n/export moved.json\n', timeout=10)
+        finally:
+            if p.poll() is None: p.kill()
+        assert 'cannot read system file' in err and (start / 'moved.json').exists() and not (other / 'moved.json').exists(), err
         # A relative auth_file is pinned when set, so changing directory cannot move it.
         p = invoke(text=f'/set auth_file creds.json\n/set cwd {other}\n/set auth_file\n')
         assert json.dumps(str(start / 'creds.json')) in p.stdout.splitlines(), p.stdout

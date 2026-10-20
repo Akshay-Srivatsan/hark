@@ -363,7 +363,11 @@ commands afterward using `--include overrides.hark` or the terminal. `--rc PATH`
 selects a different startup file; `--no-rc` skips executing it. `--cwd` sets the
 working directory but does not select the rc; a later `/set cwd PATH` changes the
 working directory. Relative paths, including in `harkrc`, are
-resolved from the working directory at the time the command runs.
+resolved from the working directory at the time the command runs. Settings that
+name your own files are resolved once, when set, and kept as absolute paths, so a
+later `/set cwd` does not change which file they mean: `system_files` (and
+`--system-file`, from `--cwd`) and `auth_file`. `instruction_files` stay relative,
+since they name a file in each working directory.
 Blank lines and lines beginning with `#` are ignored. Command files support CRLF
 and a final line without a newline.
 

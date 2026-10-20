@@ -24,8 +24,6 @@ The same pattern works for `persistence` and `terminal`. `tests/integration.py` 
 
 Tests must never touch the real user's directories. Every suite sets `HOME` to a temp directory and strips `XDG_*`. Keep doing that in new tests, because the developer's shell exports `XDG_*_HOME`.
 
-One failure predates the current work and is not a regression: the `--cwd … --system-file work/system.txt` assertion in `persistence.test_local`, caused by rc commands running after CLI flags.
-
 Portability checks: the code targets Linux, BSD, macOS back to 10.4 Tiger (libcurl 7.13.1, gcc 4.0, no `clock_gettime`) and Windows (MinGW). Native code cannot be run for those here, so at least compile-check them:
 
 ```sh
@@ -48,6 +46,7 @@ x86_64-w64-mingw32-gcc -std=c99 -Wall -Wextra -pedantic -c platform.c -o /dev/nu
 
 - **Precedence:** CLI flags and environment variables are parsed first (`options()`). The rc file (`$XDG_CONFIG_HOME/hark/harkrc`, falling back to legacy `~/.harkrc`) is then replayed as ordinary input lines, so rc commands override flags.
 - **`/set` rebuilds the whole config:** `set_option()` serializes the current state with `configuration()`, applies the key, and re-runs `options()` with no CLI arguments. Any `Config` field missing from `configuration()` silently resets on every `/set`. Process-wide state such as the active session or job table lives in module statics for this reason.
+- **Path settings:** user-file paths (`auth_file`, `system_files`) are made absolute when set: CLI values in `main()`, and `/set` values in `set_option()`. A later `/set cwd` therefore cannot redirect them. `instruction_files` intentionally stay relative.
 - **Recoverable config errors:** during `set_option()`, `die()` long-jumps back through `config_recovery`, so a bad setting is rejected, not fatal. Call `die()`/`bad_setting()` for validation in `options()` and its helpers. Do not change state (history, cwd) before the point where a rebuild can still fail, or undo it in the recovery path.
 - **Input sources:** the main loop in `main()` takes input from the rc, `--include` files, the initial prompt and the terminal (Isocline, or plain stdio with `--no-line-edit`). Slash commands from files run exactly like terminal input.
 
