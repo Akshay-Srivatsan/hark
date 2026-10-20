@@ -14,6 +14,12 @@ __pycache__/
 .harkrc.*
 # Sidecar locks from /save and /export.
 *.lock
+!flake.lock
+
+# Nix build and development outputs.
+/result
+/result-*
+/.direnv/
 
 # macOS Finder metadata.
 .DS_Store

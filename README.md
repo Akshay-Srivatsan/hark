@@ -42,6 +42,21 @@ so building requires no network access. Isocline is built with `-Wno-unused-func
 because it leaves helpers unused when built as one file. For a compiler without
 that flag, use `make ISOCLINE_CFLAGS=`.
 
+### Nix
+
+With Nix flakes enabled:
+
+```sh
+nix build               # build and test; binary at ./result/bin/hark
+nix run -- --help       # run Hark directly
+nix develop            # C compiler, make, libcurl, and Python 3
+nix flake check        # build and run the unit and CLI smoke tests
+```
+
+Inside `nix develop`, use `make`, `make test`, `make integration`, and
+`make terminal` as usual. The flake supports x86_64 and aarch64 on Linux and
+macOS; `flake.lock` pins its dependencies.
+
 ### Platforms
 
 The harness makes no assumptions about byte order, pointer width, alignment, or
