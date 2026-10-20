@@ -5,7 +5,7 @@
  * text is laid out as Markdown (styled when color is on, else spacing only).
  * Untrusted text is still printed through host_print, so only Hark emits escapes. */
 enum { MODE_NEVER, MODE_ALWAYS, MODE_AUTO };
-/* always|yes|force, never|no|none, auto|tty|if-tty; -1 if invalid. */
+/* always, never or auto; -1 if invalid. */
 int render_mode(const char *value);
 const char *render_mode_name(int mode);
 void render_setup(int color, int markdown); /* Modes; auto checks stdout. */

@@ -142,15 +142,15 @@ StoreLock *store_lock(const char *path) {
 }
 void store_unlock(StoreLock *l) { if (l) { close_lock(l->lock); free(l); } }
 int store_write(const char *path, const char *text) {
-    char *lock_path; StateLock lock; int ok = 0, exists;
+    StoreLock *lock; int ok = 0, exists;
     if (startup_file(path)) { fputs("refusing to write a startup file (harkrc or --rc); choose another file\n", stderr); return 0; }
-    lock_path = xmalloc(strlen(path) + 6); sprintf(lock_path, "%s.lock", path); lock = open_lock(lock_path); free(lock_path);
-    if (lock == NO_LOCK) { fputs("cannot lock file for saving\n", stderr); return 0; }
+    lock = store_lock(path);
+    if (!lock) { fputs("cannot lock file for saving\n", stderr); return 0; }
     exists = exists_file(path);
     if (exists < 0 || (exists && !usable(path))) goto done;
     if (strlen(text) <= STORE_LIMIT) ok = host_write_secret(path, text);
 done:
-    close_lock(lock);
+    store_unlock(lock);
     if (!ok) fputs("cannot save file (maximum 32 MiB; destination must be a regular owned file)\n", stderr);
     return ok;
 }

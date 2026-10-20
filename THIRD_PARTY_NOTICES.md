@@ -16,6 +16,9 @@ The full GPL version 3 is in [LICENSE](LICENSE).
   Its TLS backend and other enabled features have their own licenses. When
   distributing binaries, include the applicable notices and satisfy the licenses
   of the particular libcurl build and its dependencies.
+* **Tcl** is linked from the host or cross toolchain, and is not vendored.
+  Its BSD-style [license](https://github.com/tcltk/tcl/blob/core-8-6-branch/license.terms)
+  and script-library notices apply when distributing it with Hark. Tk is not used.
 
 The device-code flow interoperates with the public Codex OAuth client. Its
 protocol was checked against OpenAI's official documentation and public Codex

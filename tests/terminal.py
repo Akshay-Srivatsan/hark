@@ -59,18 +59,18 @@ def test_editor():
         try:
             read_until(b'> ')
             # Ctrl-B moves left; Ctrl-D deletes inside a nonempty line.
-            command(b'/model tXst\x02\x02\x02\x04e\r', b'model: test\r\n')
+            command(b'/config model tXst\x02\x02\x02\x04e\r', b'test\r\n')
             # Recall the previous complete command.
-            command(b'\x1b[A\r', b'model: test\r\n')
+            command(b'\x1b[A\r', b'test\r\n')
             # Ctrl-U clears the prefix; Ctrl-A/E move to line boundaries.
             command(b'garbage\x01\x05\x15/status\r', b'thinking: default\r\n')
             # Completion and setting changes.
-            command(b'/thinking hi\t\r', b'thinking: high\r\n')
-            command(b'/speed fast\r', b'speed: fast\r\n')
+            command(b'/config thinking hi\t\r', b'high\r\n')
+            command(b'/config speed fast\r', b'fast\r\n')
             # Ctrl-R history search, accept found entry, then submit it.
-            command(b'\x12/model\r\r', b'model: test\r\n')
+            command(b'\x12/config model\r\r', b'test\r\n')
             # Ctrl-C cancels input while preserving the session.
-            os.write(master, b'/model unwanted\x03')
+            os.write(master, b'/config model unwanted\x03')
             time.sleep(.1)
             command(b'/status\r', b'model: test\r\n')
             # Empty-line Ctrl-D exits and restores cooked terminal attributes.
@@ -210,8 +210,8 @@ def test_interrupt(line_edit=True):
             read_until(b'[finished job 2: exit 0] sleep 0.3')
             read_until(b'> ')
             # ^C at a human approval prompt denies and interrupts; the session continues.
-            os.write(master, b'/approval ask\r')
-            read_until(b'approval: ask')
+            os.write(master, b'/config approval ask\r')
+            read_until(b'ask\r\n')
             read_until(b'> ')
             os.write(master, b'ask\r')
             read_until(b'[y/N] ')
@@ -219,9 +219,15 @@ def test_interrupt(line_edit=True):
             read_until(b'[interrupted]')
             read_until(b'> ')
             os.write(master, b'/status\r')
-            read_until(b'approval: ask')
+            read_until(b'ask\r\n')
             read_until(b'> ')
             assert b'asked\r\n' not in transcript.split(b'echo asked', 1)[1]
+            # Tcl loops are interruptible, and return to the same prompt.
+            os.write(master, b'/while 1 {}\r')
+            time.sleep(.2)
+            os.write(master, b'\x03')
+            read_until(b'[interrupted]')
+            read_until(b'> ')
             # ^D on an empty prompt exits normally.
             time.sleep(.1)
             os.write(master, b'\x04')

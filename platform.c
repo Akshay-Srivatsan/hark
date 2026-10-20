@@ -142,18 +142,22 @@ int host_tty(void) {
     return isatty(STDIN_FILENO);
 #endif
 }
+static void (*interrupt_hook)(void);
+void host_interrupt_hook(void (*hook)(void)) { interrupt_hook = hook; }
 #ifdef _WIN32
 static volatile LONG interrupt_flag; static int interrupt_armed;
 static BOOL WINAPI on_console(DWORD type) {
     if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT) return FALSE;
-    interrupt_flag = 1; return TRUE;
+    interrupt_flag = 1;
+    if (interrupt_hook) interrupt_hook();
+    return TRUE;
 }
 void host_interrupt_arm(void) { if (!interrupt_armed && SetConsoleCtrlHandler(on_console, TRUE)) interrupt_armed = 1; }
 void host_interrupt_disarm(void) { if (interrupt_armed) (void)SetConsoleCtrlHandler(on_console, FALSE); interrupt_armed = 0; }
 #else
 static volatile sig_atomic_t interrupt_flag; static int interrupt_armed;
 static struct sigaction previous_int;
-static void on_sigint(int sig) { (void)sig; interrupt_flag = 1; }
+static void on_sigint(int sig) { (void)sig; interrupt_flag = 1; if (interrupt_hook) interrupt_hook(); }
 void host_interrupt_arm(void) {
     struct sigaction action;
     if (interrupt_armed) return;

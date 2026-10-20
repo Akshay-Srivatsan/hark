@@ -6,12 +6,14 @@
 
 static void complete_commands(ic_completion_env_t *env, const char *prefix) {
     static const char *commands[] = {
-        "/approval", "/approval model", "/approval ask", "/approval deny", "/approval allow",
-        "/review-model ", "/review-model default", "/models", "/model ", "/speed ", "/thinking ", "/status", "/jobs", "/kill ", "/help",
-        "/compact", "/reset", "/quit", "/set ", "/export ", "/context ", "/save ", "/include ", "/import ", "/prompt ",
-        "/speed auto", "/speed standard", "/speed fast", "/speed flex", "/speed ultrafast",
-        "/thinking default", "/thinking none", "/thinking minimal", "/thinking low",
-        "/thinking medium", "/thinking high", "/thinking xhigh", "/thinking max", NULL
+        "/set hark(", "/config ", "/array get hark", "/models", "/status", "/jobs", "/kill ", "/help",
+        "/compact", "/reset", "/quit", "/export ", "/context ", "/save ",
+        "/source ", "/import ", "/prompt ", "/prompt-file ",
+        "/config model ", "/config review_model ",
+        "/config approval model", "/config approval ask", "/config approval deny", "/config approval allow",
+        "/config speed auto", "/config speed standard", "/config speed fast", "/config speed flex", "/config speed ultrafast",
+        "/config thinking default", "/config thinking none", "/config thinking minimal", "/config thinking low",
+        "/config thinking medium", "/config thinking high", "/config thinking xhigh", "/config thinking max", NULL
     };
     if (*prefix == '/') (void)ic_add_completions(env, prefix, commands);
 }

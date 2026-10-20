@@ -6,6 +6,8 @@ CFLAGS = -O2 -std=c99 -Wall -Wextra -pedantic
 CPPFLAGS =
 LDFLAGS =
 LDLIBS = -lcurl
+TCL_CFLAGS =
+TCL_LIBS = -ltcl8.6
 # Isocline is built as one translation unit, so helpers it never calls are
 # reported as unused. Keep vendored sources unmodified; set empty for compilers
 # without this GCC/Clang flag.
@@ -17,9 +19,10 @@ OBJ = hark.o json.o net.o auth.o platform.o line.o store.o session.o render.o yy
 all: hark
 
 hark: $(OBJ)
-	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS) $(TCL_LIBS)
 
 hark.o: hark.c json.h net.h auth.h platform.h line.h store.h session.h render.h
+	$(CC) $(CPPFLAGS) $(TCL_CFLAGS) $(CFLAGS) -c hark.c
 json.o: json.c json.h vendor/yyjson/yyjson.h
 net.o: net.c net.h json.h
 auth.o: auth.c auth.h net.h json.h platform.h

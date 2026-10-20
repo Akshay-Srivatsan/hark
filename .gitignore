@@ -6,8 +6,7 @@
 /tests/unit.exe
 __pycache__/
 
-# Local Hark files. Sessions and logins live in per-user XDG directories, but
-# pre-XDG credentials and project startup files may sit in a checkout.
+# Local credentials and project command files.
 .hark-auth.json
 .hark-auth.json.*
 .harkrc

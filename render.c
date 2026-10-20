@@ -16,9 +16,9 @@ static char *line; static size_t used, cap;
 static char *rows[TABLE_ROWS]; static size_t nrows;
 
 int render_mode(const char *v) {
-    static const char *const names[] = {"never", "no", "none", "always", "yes", "force", "auto", "tty", "if-tty"};
+    static const char *const names[] = {"never", "always", "auto"};
     size_t i;
-    for (i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(v, names[i])) return (int)(i / 3);
+    for (i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(v, names[i])) return (int)i;
     return -1;
 }
 const char *render_mode_name(int mode) { return mode == MODE_ALWAYS ? "always" : mode == MODE_AUTO ? "auto" : "never"; }

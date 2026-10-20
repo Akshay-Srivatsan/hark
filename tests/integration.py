@@ -203,19 +203,19 @@ def test_approval_commands():
                 assert bool(result.get('denied')) == (task in ('deny task', 'ask task'))
                 return 200, response('finished', chat=chat), False
             return 200, response(calls=[('call-' + str(len(h)), '{"command":"printf x >> result"}')], chat=chat), False
-        commands = ('/approval\nfirst task\n/model alternate\nsecond task\n'
-                    '/review-model pinned\nthird task\n/model third\nfourth task\n'
-                    '/review-model default\nfifth task\n/approval deny\ndeny task\n'
-                    '/approval allow\nallow task\n/approval ask\nask task\n'
-                    '/approval model\nlast task\n/approval invalid\n/review-model invalid id\n/status\n/quit\n')
+        commands = ('/set hark(approval)\nfirst task\n/config model alternate\nsecond task\n'
+                    '/config review_model pinned\nthird task\n/config model third\nfourth task\n'
+                    '/config review_model {}\nfifth task\n/config approval deny\ndeny task\n'
+                    '/config approval allow\nallow task\n/config approval ask\nask task\n'
+                    '/config approval model\nlast task\n/config approval invalid\n/config review_model invalid\\ id\n/status\n/quit\n')
         p, req, files = run(handle, ['--api', 'chat' if chat else 'responses', '--speed', 'fast', '--thinking', 'high'], prompt=None, stdin=commands)
-        assert p.returncode == 0 and files['result'] == 'xxxxxxx', (p.stdout, p.stderr, files)
+        assert p.returncode == 1 and files['result'] == 'xxxxxxx', (p.stdout, p.stderr, files)
         assert reviewers == ['main', 'alternate', 'pinned', 'pinned', 'third', 'third'], reviewers
-        assert 'approval: model' in p.stdout and 'review-model: third' in p.stdout
-        assert 'invalid approval mode' in p.stderr and 'invalid reviewer model ID' in p.stderr
-    # CLI reset also follows the agent, rather than requesting a model named default.
+        assert 'approval: model' in p.stdout and 'review_model: third' in p.stdout
+        assert 'approval must be' in p.stderr and 'invalid reviewer model ID' in p.stderr
+    # An empty reviewer override follows the agent.
     main = tool_round()
-    p, _, files = run(lambda path, b, h: main(path, b, h) if 'tools' in b else (200, response('ALLOW'), False), ['--review-model', 'default'])
+    p, _, files = run(lambda path, b, h: main(path, b, h) if 'tools' in b else (200, response('ALLOW'), False), ['--review-model', ''])
     assert p.returncode == 0 and files['result'] == 'done', p.stderr
 
 
@@ -386,7 +386,7 @@ def test_settings():
             else:
                 assert 'service_tier' not in body and 'reasoning_effort' not in body and 'reasoning' not in body
             return 200, response('done', chat=chat), False
-        commands = '/model main\n/speed fast\n/thinking high\nfirst request\n/model alternate\n/speed standard\n/thinking none\nsecond request\n/speed auto\n/thinking default\nthird request\n/status\n/quit\n'
+        commands = '/config model main\n/config speed fast\n/config thinking high\nfirst request\n/config model alternate\n/config speed standard\n/config thinking none\nsecond request\n/config speed auto\n/config thinking default\nthird request\n/status\n/quit\n'
         p, req, _ = run(handle, ['--api', 'chat' if chat else 'responses'], prompt=None, include_model=False, stdin=commands)
         assert p.returncode == 0 and len(req) == 3, p.stderr
         assert 'model: alternate' in p.stdout and 'speed: auto' in p.stdout and 'thinking: default' in p.stdout
@@ -402,8 +402,18 @@ def test_settings():
     assert p.returncode == 0 and files['result'] == 'done'
     p, _, _ = run(lambda path, body, headers: (200, response('ok') if body['service_tier'] == 'ultrafast' and body['reasoning']['effort'] == 'low' else {}, False), ['--speed', 'ultrafast', '--thinking', 'low'])
     assert p.returncode == 0, p.stderr
-    p, req, _ = run(lambda *_: (_ for _ in ()).throw(AssertionError('must not request')), prompt=None, stdin='/speed invalid\n/thinking invalid\n/model invalid id\n/status\n/quit\n')
-    assert p.returncode == 0 and not req and 'speed: auto' in p.stdout and 'thinking: default' in p.stdout and 'model: main' in p.stdout
+    p, req, _ = run(lambda *_: (_ for _ in ()).throw(AssertionError('must not request')), prompt=None, stdin='/config speed invalid\n/config thinking invalid\n/config model invalid\\ id\n/status\n/quit\n')
+    assert p.returncode == 1 and not req and 'speed: auto' in p.stdout and 'thinking: default' in p.stdout and 'model: main' in p.stdout
+
+
+def test_tcl_prompts():
+    prompts = []
+    def handle(path, body, headers):
+        prompts.append(body['input'][-1]['content'])
+        return 200, response('done'), False
+    script = '/config model main\n/prompt {literal $x [error nope]; λ😀}\n/prompt {first line\nsecond line}\n/quit\n'
+    p, _, _ = run(handle, prompt=None, stdin=script)
+    assert p.returncode == 0 and prompts == ['literal $x [error nope]; λ😀', 'first line\nsecond line'], (p.stdout, p.stderr, prompts)
 
 
 def test_provider_errors():
@@ -485,7 +495,7 @@ def test_jobs():
                 assert 'job_kill takes' in outputs['kx']['error'] and 'sh takes' in outputs['x']['error']
                 return 200, response('done', chat=chat), False
             raise AssertionError('unexpected request')
-        p, req, files = run(handle, ['--approval', 'allow', '--shell-timeout', '20'] + (['--api', 'chat'] if chat else []))
+        p, req, files = run(handle, ['--approval', 'allow', '--shell-timeout', '20'] + (['--api', 'chat'] if chat else []), **({'prompt': None, 'stdin': 'start jobs\n/exit\n'} if chat else {}))
         assert p.returncode == 0 and state['n'] == 6, (p.stdout, p.stderr)
         assert '$ sleep 1; echo A &\n[job 1 started]' in p.stdout and '[job 1: exit 0] sleep 1; echo A' in p.stdout, p.stdout
         assert '[job 3: timed out after 1s]' in p.stdout and '[job 4: killed]' in p.stdout and '[stopping 1 background job]' in p.stderr
@@ -680,7 +690,7 @@ def test_context_usage():
             return 200, {'object': 'list', 'data': [{'id': 'main'}]}, False
         return handle(path, body, headers)
     p, _, _ = run(no_window, prompt=None, stdin='hello\n/status\n')
-    assert 'context: window unknown (set context_window)' in p.stdout, p.stdout
+    assert 'context: window unknown (set hark(context_window))' in p.stdout, p.stdout
     # Chat streams ask for usage, which arrives in a final chunk without choices.
     def chat(body):
         assert body['stream_options'] == {'include_usage': True}
@@ -707,16 +717,15 @@ def test_presentation():
             return 200, response('red \x1b[31mtext\x1b[0m and \u009b31m'), False
         return 200, response(md), False
     # Defaults: no escapes, even with NO_COLOR unset; auto is off in a pipe.
-    for flags in ([], ['--color=auto', '--markdown=tty']):
+    for flags in ([], ['--color=auto', '--markdown=auto']):
         p, _, _ = run(handle, ['--approval', 'allow', *flags], prompt='tools')
         assert p.returncode == 0 and '\x1b' not in p.stdout and '$ true\n[exit 0]\n' in p.stdout, p.stdout
     # always colors tool lines and outcomes; NO_COLOR does not override always.
     p, _, _ = run(handle, ['--approval', 'allow', '--color'], prompt='tools', env={'NO_COLOR': '1'})
     assert '\x1b[1;36m$ true\x1b[0m' in p.stdout and '\x1b[32m[exit 0]\x1b[0m' in p.stdout and '\x1b[31m[exit 3]\x1b[0m' in p.stdout, repr(p.stdout)
-    # Every spelling of the three states, via flags and /set; bad values are errors.
-    for value, colored in (('yes', True), ('force', True), ('no', False), ('none', False), ('tty', False), ('if-tty', False)):
-        p, _, _ = run(handle, ['--approval', 'allow'], prompt=None, stdin=f'/set color {value}\ntools\n/set color\n')
-        assert ('\x1b[' in p.stdout) == colored and ('"always"' if colored else ('"never"' if value in ('no', 'none') else '"auto"')) in p.stdout, (value, p.stdout)
+    for value, colored in (('always', True), ('never', False), ('auto', False)):
+        p, _, _ = run(handle, ['--approval', 'allow'], prompt=None, stdin=f'/config color {value}\ntools\n/set hark(color)\n')
+        assert p.returncode == 0 and ('\x1b[' in p.stdout) == colored and value in p.stdout, (value, p.stdout)
     p, _, _ = run(handle, ['--color=sometimes'])
     assert p.returncode == 1 and '--color takes always, never or auto' in p.stderr
     # Markdown without color only adds spacing: aligned tables, indented code.
@@ -902,7 +911,7 @@ def test_device_auth():
             root = pathlib.Path(__file__).resolve().parent.parent
             binary = str(pathlib.Path(tmp) / 'hark-auth-test')
             compiler = shlex.split(os.environ.get('CC', 'cc'))
-            cmd = [*compiler, '-std=c99', '-O0', '-DHARK_AUTH_ISSUER="' + origin + '"', '-DHARK_CHATGPT_BASE="' + origin + '/backend"', '-DHARK_OPENAI_BASE="' + origin + '/v1"', '-o', binary, 'hark.c', 'auth.c', 'json.c', 'net.c', 'platform.c', 'line.c', 'store.c', 'session.c', 'render.c', 'yyjson.o', 'isocline.o', '-lcurl']
+            cmd = [*compiler, *shlex.split(os.environ.get('TCL_CFLAGS', '')), '-std=c99', '-O0', '-DHARK_AUTH_ISSUER="' + origin + '"', '-DHARK_CHATGPT_BASE="' + origin + '/backend"', '-DHARK_OPENAI_BASE="' + origin + '/v1"', '-o', binary, 'hark.c', 'auth.c', 'json.c', 'net.c', 'platform.c', 'line.c', 'store.c', 'session.c', 'render.c', 'yyjson.o', 'isocline.o', '-lcurl', *shlex.split(os.environ.get('TCL_LIBS', '-ltcl8.6'))]
             subprocess.run(cmd, cwd=root, check=True, env={**os.environ, 'CCACHE_DISABLE': '1'}, capture_output=True)
             auth = pathlib.Path(tmp) / 'credentials.json'
             clean_env = {k: v for k, v in os.environ.items() if not k.startswith('XDG_') and k not in ('HARK_MODEL', 'HARK_API', 'HARK_API_KEY', 'HARK_BASE_URL', 'OPENAI_API_KEY', 'HARK_SPEED', 'HARK_THINKING', 'HARK_CODEX_CLIENT_VERSION')}
@@ -949,7 +958,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_stream_errors, test_http_timeout, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_tcl_prompts, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_stream_errors, test_http_timeout, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

@@ -23,8 +23,8 @@
               ./.;
           };
 
-          buildInputs = [ pkgs.curl ];
-          makeFlags = [ "CC=${pkgs.stdenv.cc.targetPrefix}cc" "PREFIX=$(out)" ];
+          buildInputs = [ pkgs.curl pkgs.tcl ];
+          makeFlags = [ "CC=${pkgs.stdenv.cc.targetPrefix}cc" "PREFIX=$(out)" "TCL_LIBS=-ltcl8.6" ];
           enableParallelBuilding = true;
 
           doCheck = true;

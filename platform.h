@@ -31,6 +31,7 @@ void host_interrupt_arm(void);
 void host_interrupt_disarm(void);
 int host_interrupted(void);
 void host_interrupt_clear(void);
+void host_interrupt_hook(void (*hook)(void));
 char *host_run(const char *shell, const char *command, unsigned seconds,
                size_t limit, int *status, int *timed_out, int *truncated);
 /* Background jobs: like host_run, but asynchronous. A job keeps running, with its
