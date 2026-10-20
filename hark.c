@@ -241,7 +241,7 @@ static void usage(void) {
          "  --compact-bytes N      Compact at serialized history size (default 196608; 0 off)\n"
          "  --max-steps N          Max model rounds per user turn (default 100)\n"
          "  --context-window N     Model context size in tokens, for the prompt's usage figure\n"
-         "  --http-timeout SEC     Default 300\n"
+         "  --http-timeout SEC     Give up after this long with no data from the provider (default 300)\n"
          "  --system-file PATH     Append trusted instructions from file (repeatable)\n"
          "  --no-line-edit         Use plain terminal input\n"
          "  --no-stream            Show replies when complete instead of as they arrive\n"
@@ -537,11 +537,16 @@ static Json *tool_schemas(const Config *c, int chat) {
     jadd(arr, tool(chat, "job_kill", "Stop a background job and the processes it started.", "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}"));
     return arr;
 }
-static Json *request(Provider *p, const Json *history, const char *instructions, const Config *tools, int stream) {
+/* Compaction and approval review run unattended, and the idle timeout cannot stop
+ * a model that keeps reasoning, so their replies (reasoning included) are capped. */
+#define BACKGROUND_TOKENS 16384
+static Json *request(Provider *p, const Json *history, const char *instructions, const Config *tools, int stream, int background) {
     Json *j = jnew(J_OBJ), *arr = jnew(J_ARR), *v;
     /* The ChatGPT backend only streams. */
     jset(j, "model", jstr(p->model)); jset(j, "stream", jbool(p->auth != NULL || stream));
     if (stream && p->api == 1) jset(j, "stream_options", jparse("{\"include_usage\":true}"));
+    /* Not for the ChatGPT backend, whose accepted fields are narrower. */
+    if (background && !p->auth) jset(j, p->api == 1 ? "max_completion_tokens" : "max_output_tokens", jnum(BACKGROUND_TOKENS));
     if (p->speed && strcmp(p->speed, "auto")) {
         const char *tier = !strcmp(p->speed, "standard") ? "default" : !strcmp(p->speed, "fast") ? "priority" : p->speed;
         jset(j, "service_tier", jstr(tier));
@@ -629,9 +634,11 @@ static Json *send_request(Provider *p, Json *req, int *context_error, Live *live
     }
     free(body); free(url); return j;
 }
-/* LIVE, when given, streams the reply to the terminal; other requests stay quiet. */
-static Json *generate(Provider *p, const Json *h, const char *sys, const Config *tools, int *ctx, Live *live) {
-    Json *req = request(p, h, sys, tools, live != NULL), *r = send_request(p, req, ctx, live); jfree(req); return r;
+/* STREAM asks for a streamed reply, which keeps a slow (e.g. long-reasoning) request
+ * active under the idle timeout. LIVE, when given, also shows it as it arrives.
+ * BACKGROUND (compaction, review) caps the reply's length. */
+static Json *generate(Provider *p, const Json *h, const char *sys, const Config *tools, int *ctx, Live *live, int stream, int background) {
+    Json *req = request(p, h, sys, tools, stream || live, background), *r = send_request(p, req, ctx, live); jfree(req); return r;
 }
 /* Reasoning a complete reply carries: Chat reasoning_content, or Responses summaries. */
 static char *reasoning_text(const Json *r, int chat) {
@@ -723,7 +730,9 @@ static int compact(Config *c, Json **history, const char *latest, const char *sy
     fputs("[compacting conversation]\n", stderr);
     /* Same system prompt and tools, with the request appended: the cached prefix is reused. */
     ask = jcopy(*history); jadd(ask, message("user", compact_prompt));
-    r = generate(&c->main, ask, sys, c, &ctx, NULL); jfree(ask);
+    r = generate(&c->main, ask, sys, c, &ctx, NULL, c->stream, 1); jfree(ask);
+    if (r && !complete(r, c->main.api)) fputs("compaction failed: the summary was incomplete (it may have reached the length limit); original retained\n", stderr);
+    else if (r && !text_only(r, c->main.api)) fputs("compaction failed: the model called a tool instead of summarizing; original retained\n", stderr);
     if (!r || !complete(r, c->main.api) || !text_only(r, c->main.api)) { jfree(r); return 0; }
     text = response_text(r, c->main.api); jfree(r);
     if (!*text) { free(text); return 0; }
@@ -762,7 +771,7 @@ static int review(Config *c, const char *cmd, const char *latest, const Json *hi
         jfree(r);
     } else {
         char *start, *end;
-        h = jnew(J_ARR); jadd(h, message("user", s)); r = generate(&reviewer, h, instructions, NULL, &ctx, NULL); jfree(h);
+        h = jnew(J_ARR); jadd(h, message("user", s)); r = generate(&reviewer, h, instructions, NULL, &ctx, NULL, c->stream, 1); jfree(h);
         if (r && complete(r, reviewer.api) && text_only(r, reviewer.api)) {
             text = response_text(r, reviewer.api); start = text; while (*start == ' ' || *start == '\n' || *start == '\r' || *start == '\t') start++;
             end = start + strlen(start); while (end > start && (end[-1] == ' ' || end[-1] == '\n' || end[-1] == '\r' || end[-1] == '\t')) *--end = 0;
@@ -1051,7 +1060,7 @@ static int turn(Config *c, Json **h, const char *sys, const char *latest) {
         checkpoint(c, *h, latest); /* The request so far, and each completed tool round. */
         if (c->compact_bytes) { char *s = jdump(*h); size_t n = strlen(s); free(s); if (n >= c->compact_bytes && !compact(c, h, latest, sys)) return 0; }
         memset(&live, 0, sizeof live); live.chat = chat; live.show_thinking = c->show_thinking;
-        r = generate(&c->main, *h, sys, c, &ctx, c->stream ? &live : NULL);
+        r = generate(&c->main, *h, sys, c, &ctx, c->stream ? &live : NULL, c->stream, 0);
         if (!r) { if (host_interrupted()) return 0; if (ctx && !retried_context && c->compact_bytes && compact(c, h, latest, sys)) { retried_context = 1; continue; } return 0; }
         if (!complete(r, chat)) { fputs("incomplete model response; no commands executed\n", stderr); jfree(r); return 0; }
         record_usage(r, chat);

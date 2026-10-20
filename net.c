@@ -54,20 +54,28 @@ static struct curl_slist *header(struct curl_slist *h, const char *name, const c
     s = xmalloc(strlen(name) + strlen(value) + 3); sprintf(s, "%s: %s", name, value);
     next = curl_slist_append(h, s); free(s); if (!next) { fputs("out of memory\n", stderr); exit(1); } return next;
 }
-/* libcurl polls this about once a second while idle; nonzero aborts on ^C. */
+/* libcurl calls this about once a second even while idle. It aborts on ^C, and
+ * after TIMEOUT seconds with no bytes sent or received: an idle timeout, so a long
+ * streamed reply is never cut off but a stalled request still fails. */
+typedef struct { double last, moved; unsigned timeout; int idle; } Idle;
 #if LIBCURL_VERSION_NUM >= 0x072000
-static int progress(void *ctx, curl_off_t a, curl_off_t b, curl_off_t c, curl_off_t d) {
+static int progress(void *ctx, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
 #else
-static int progress(void *ctx, double a, double b, double c, double d) {
+static int progress(void *ctx, double dltotal, double dlnow, double ultotal, double ulnow) {
 #endif
-    (void)ctx; (void)a; (void)b; (void)c; (void)d; return host_interrupted();
+    Idle *w = ctx; double moved = (double)dlnow + (double)ulnow, t = host_seconds();
+    (void)dltotal; (void)ultotal;
+    if (host_interrupted()) return 1;
+    if (moved != w->moved || !w->last) { w->moved = moved; w->last = t; return 0; }
+    if (t - w->last >= w->timeout) { w->idle = 1; return 1; }
+    return 0;
 }
 static int has_scheme(const char *url, const char *scheme) {
     for (; *scheme; url++, scheme++) if (tolower((unsigned char)*url) != *scheme) return 0;
     return 1;
 }
 static Http http_request(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout, Sse *live) {
-    Http r = {NULL, 0}; Body b = {NULL, 0, NULL}; CURL *c = curl_easy_init(); CURLcode rc; struct curl_slist *h = NULL; char err[CURL_ERROR_SIZE] = {0};
+    Http r = {NULL, 0}; Body b = {NULL, 0, NULL}; Idle idle = {0, 0, 0, 0}; CURL *c = curl_easy_init(); CURLcode rc; struct curl_slist *h = NULL; char err[CURL_ERROR_SIZE] = {0};
     /* Older libcurl lacks CURLOPT_PROTOCOLS, so check the scheme here too. */
     if (!has_scheme(url, "http://") && !has_scheme(url, "https://")) { fputs("only HTTP and HTTPS URLs are supported\n", stderr); if (c) curl_easy_cleanup(c); return r; }
     if (!c) { fputs("cannot initialize HTTP\n", stderr); return r; }
@@ -87,13 +95,15 @@ static Http http_request(const char *url, const char *key, const char *account, 
     b.live = live; curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
     curl_easy_setopt(c, CURLOPT_ERRORBUFFER, err);
     curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    idle.timeout = timeout;
 #if LIBCURL_VERSION_NUM >= 0x072000
     curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, progress);
+    curl_easy_setopt(c, CURLOPT_XFERINFODATA, &idle);
 #else
     curl_easy_setopt(c, CURLOPT_PROGRESSFUNCTION, progress);
+    curl_easy_setopt(c, CURLOPT_PROGRESSDATA, &idle);
 #endif
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 30L);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT, (long)timeout);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(c, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -107,7 +117,12 @@ static Http http_request(const char *url, const char *key, const char *account, 
     rc = curl_easy_perform(c);
     if (live) (void)sse_finish(live); /* Display only; the body is assembled separately. */
     if (rc == CURLE_OK) { curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status); r.body = b.s ? b.s : xstrdup(""); }
-    else { if (!host_interrupted()) fprintf(stderr, "HTTP transport failed: %s\n", err[0] ? err : curl_easy_strerror(rc)); free(b.s); }
+    else {
+        if (host_interrupted()) {}
+        else if (idle.idle) fprintf(stderr, "HTTP transport failed: no data from the provider for %u seconds (see --http-timeout)\n", timeout);
+        else fprintf(stderr, "HTTP transport failed: %s\n", err[0] ? err : curl_easy_strerror(rc));
+        free(b.s);
+    }
     curl_slist_free_all(h); curl_easy_cleanup(c); return r;
 }
 Http http_post(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout) {

@@ -235,12 +235,15 @@ def test_compact():
                 # Compaction extends the previous request, so the cached prefix is reused:
                 # same system prompt and tools, earlier messages unchanged, the ask appended.
                 prev = seen[-2]
+                assert body['stream'] is True, 'compaction streams, so slow models stay under the idle timeout'
+                assert body['max_completion_tokens' if chat else 'max_output_tokens'] == 16384, 'a runaway summary is capped'
                 assert body['tools'] == prev['tools'] and body.get('instructions') == prev.get('instructions')
                 prev_history = prev['messages' if chat else 'input']
                 assert history[:len(prev_history)] == prev_history and len(history) > len(prev_history) + 1
                 assert 'payload' in json.dumps(history)
                 return 200, response('Task still pending; inspection completed.', chat=chat), False
             n += 1
+            assert 'max_output_tokens' not in body and 'max_completion_tokens' not in body, 'agent turns are not capped'
             if not chat:
                 # Every Responses input item has a type; llama.cpp rejects role-only messages.
                 assert all(v.get('type') for v in history), history
@@ -252,6 +255,14 @@ def test_compact():
             return 200, response('done', chat=chat), False
         p, req, _ = run(handle, ['--allow', '*', '--compact-bytes', '2000', '--api', 'chat' if chat else 'responses'], prompt='Keep this user request exactly')
         assert p.returncode == 0 and len(req) == 3, (p.stderr, p.stdout)
+    # A summary that hits the length limit fails cleanly, keeping the history.
+    def capped(path, body, headers):
+        history = body['input']
+        if is_compaction(history):
+            return 200, {'status': 'incomplete', 'incomplete_details': {'reason': 'max_output_tokens'}, 'output': [], 'error': None}, False
+        return 200, response(calls=[('c', json.dumps({'command': "printf '%08000d' 0"}))]), False
+    p, req, _ = run(capped, ['--allow', '*', '--compact-bytes', '2000', '--no-stream'], prompt='go')
+    assert p.returncode == 1 and 'compaction failed: the summary was incomplete' in p.stderr, p.stderr
     # Refuse a summary that makes the transcript larger.
     n = 0
     def no_shrink(path, body, headers):
@@ -772,6 +783,34 @@ def test_stream_errors():
             server.shutdown(); server.server_close()
 
 
+def test_http_timeout():
+    for chat in (False, True):
+        # A reply that keeps arriving may take longer than --http-timeout in total.
+        def steady(body):
+            parts = []
+            for i in range(6):
+                parts += [lambda: time.sleep(.5), chat_chunk({'content': f'{i} '}) if chat else sse({'type': 'response.output_text.delta', 'delta': f'{i} '})]
+            return parts + ([chat_chunk(finish='stop')] if chat else responses_text('0 1 2 3 4 5 '))
+        server = stream_server(steady)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                started = time.monotonic()
+                p = subprocess.run(stream_args(server, chat, '--http-timeout', '2', '--', 'go'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=30)
+                assert p.returncode == 0 and '0 1 2 3 4 5' in p.stdout and time.monotonic() - started > 2.5, (p.stdout, p.stderr)
+        finally:
+            server.shutdown(); server.server_close()
+    # A provider that goes quiet fails after --http-timeout seconds without data.
+    server = stream_server(lambda body: [lambda: time.sleep(6), chat_chunk({'content': 'late'})])
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            started = time.monotonic()
+            p = subprocess.run(stream_args(server, True, '--http-timeout', '2', '--', 'go'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=30)
+            assert p.returncode == 1 and 'no data from the provider for 2 seconds (see --http-timeout)' in p.stderr, p.stderr
+            assert time.monotonic() - started < 5.5 and 'late' not in p.stdout
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_device_auth():
     import base64
     import shlex
@@ -910,7 +949,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_stream_errors, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_stream_errors, test_http_timeout, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

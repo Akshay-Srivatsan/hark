@@ -202,8 +202,18 @@ HTTPS certificate verification is always enabled; redirects are not followed.
 HTTP and HTTPS base URLs are accepted directly. Plain HTTP sends credentials and conversation data without TLS;
 use it only on networks you trust.
 Configure proxies and CA certificates using your libcurl build's supported
-settings/environment. HTTP requests have a configurable timeout and a 32 MiB
-response cap.
+settings/environment. Responses are capped at 32 MiB. `--http-timeout SEC` (default
+300) is an idle timeout: a request fails only after that long with no data sent or
+received, reported as `no data from the provider for SEC seconds`, so long streamed
+replies are never cut off. Connecting has its own 30-second limit. Compaction and
+approval-review requests also stream (without being shown), so a model that reasons
+for a long time keeps them active; with `--no-stream`, a slow reply must arrive
+within the timeout. Because an idle timeout cannot stop a model that keeps
+generating, those two unattended requests are capped at 16384 output tokens,
+reasoning included (`max_output_tokens`, or `max_completion_tokens` for Chat
+Completions; not sent to the ChatGPT backend). A capped summary fails compaction
+and keeps the original history; a capped review denies the command. Agent turns are
+not capped: interrupt them with Ctrl-C.
 
 Replies stream: the model's text appears as it arrives, and `[thinking]` is shown
 once while a reasoning model works (its reasoning is not printed). Tool calls are
@@ -328,7 +338,7 @@ broken startup file never leaves a partial configuration.
 | `base_url`, `api`, `model` | Provider URL, `responses` or `chat`, and model ID |
 | `key_env`, `chatgpt`, `auth_file` | Key environment variable name, device-login boolean, and credential-file path |
 | `speed`, `thinking` | The same choices as `--speed` and `--thinking` |
-| `codex_client_version`, `http_timeout` | Codex catalog compatibility version and HTTP timeout in seconds |
+| `codex_client_version`, `http_timeout` | Codex catalog compatibility version, and seconds without data before a request fails |
 | `approval`, `allow`, `deny`, `policy` | Approval mode, arrays of command globs, and additional reviewer policy |
 | `review_model`, `review_base_url`, `review_api`, `review_key_env` | Reviewer overrides; `review_model default` follows the agent |
 | `cwd`, `shell`, `shell_timeout` | Working directory, shell executable and execution timeout in seconds |
