@@ -241,6 +241,9 @@ def test_compact():
                 assert 'payload' in json.dumps(history)
                 return 200, response('Task still pending; inspection completed.', chat=chat), False
             n += 1
+            if not chat:
+                # Every Responses input item has a type; llama.cpp rejects role-only messages.
+                assert all(v.get('type') for v in history), history
             if n == 1:
                 return 200, response(calls=[('call1', json.dumps({'command': "printf 'payload%.0s' 1 2 3 4 5 6 7 8 9; printf '%08000d' 0"}))], chat=chat), False
             assert history[-1]['content'] == 'Keep this user request exactly'

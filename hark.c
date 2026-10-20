@@ -562,7 +562,14 @@ static Json *request(Provider *p, const Json *history, const char *instructions,
         for (v = history->child; v; v = v->next) jadd(arr, jcopy(v));
         jset(j, "messages", arr);
     } else {
-        jfree(arr); jset(j, "instructions", jstr(instructions)); jset(j, "input", jcopy(history)); jset(j, "store", jbool(0));
+        /* Messages carry an explicit type: OpenAI infers it, but llama.cpp rejects a
+         * role-only assistant message (such as a compaction summary). */
+        for (v = history->child; v; v = v->next) {
+            Json *item = jcopy(v);
+            if (jget(item, "role") && !jget(item, "type")) jset(item, "type", jstr("message"));
+            jadd(arr, item);
+        }
+        jset(j, "instructions", jstr(instructions)); jset(j, "input", arr); jset(j, "store", jbool(0));
         jset(j, "include", jparse("[\"reasoning.encrypted_content\"]"));
     }
     if (tools) jset(j, "tools", tool_schemas(tools, p->api == 1));
