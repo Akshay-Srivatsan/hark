@@ -161,16 +161,23 @@ static void saved_rules(const Json *saved, const char *key, const char **rules, 
         rules[(*count)++] = v->s;
     }
 }
-static char *absolute_path(const char *path) {
-    char *cwd, *result;
-    if (path[0] == '/'
+static int is_absolute(const char *path) {
+    return path[0] == '/'
 #ifdef _WIN32
         || path[0] == '\\' || (strlen(path) > 1 && path[1] == ':')
 #endif
-    ) return xstrdup(path);
-    cwd = host_cwd(); result = xmalloc(strlen(cwd) + strlen(path) + 2);
-    sprintf(result, "%s/%s", cwd, path); free(cwd); return result;
+        ;
 }
+/* PATH relative to BASE (an absolute directory) unless it is already absolute. */
+static char *path_from(const char *base, const char *path) {
+    char *result;
+    if (is_absolute(path)) return xstrdup(path);
+    result = xmalloc(strlen(base) + strlen(path) + 2); sprintf(result, "%s/%s", base, path); return result;
+}
+static char *absolute_path(const char *path) { char *cwd = host_cwd(), *result = path_from(cwd, path); free(cwd); return result; }
+/* Where Hark was started, before --cwd: relative paths typed on the command
+ * line for user files (the credential file) mean this directory. */
+static char *launch_dir;
 /* Find --cwd and the rc path before applying file, environment and CLI values.
  * Option values and prompt text are never scanned as flags. */
 /* NAME in the XDG directory, unless only the pre-XDG ~/LEGACY exists. */
@@ -199,6 +206,7 @@ static char *preload(int argc, char **argv, char **rc_path) {
         if (!strcmp(a, "--rc")) file = argv[i + 1];
         i++;
     }
+    launch_dir = host_cwd();
     if (!skip && directory && host_chdir(directory)) die("cannot change working directory");
     /* The startup file is per-user. A project's .harkrc runs only via /include. */
     if (file) *rc_path = absolute_path(file);
@@ -1253,6 +1261,8 @@ static int set_option(Config *c, Json **owned, Json *history, char **sys, char *
     if (!*value) { if (old) { char *text = jdump(old); host_print(text); puts(""); free(text); } else fputs("unknown or unset option\n", stderr); jfree(j); return old != NULL; }
     if (!strcmp(key, "version") || !strcmp(key, "history") || !strcmp(key, "latest_user")) { jfree(j); fputs("use /context or /import for conversation context\n", stderr); return 0; }
     v = jparse(value); if (!v) v = jstr(value);
+    /* Pin a relative credential path now, so a later /set cwd cannot move it. */
+    if (!strcmp(key, "auth_file") && v->type == J_STR && *v->s && !is_absolute(v->s)) { char *abs = absolute_path(v->s); jfree(v); v = jstr(abs); free(abs); }
     if ((!strcmp(key, "base_url") || !strcmp(key, "api") || !strcmp(key, "key_env"))) jset(j, "chatgpt", jbool(0));
     if (v->type == J_NULL || (v->type == J_STR && !strcmp(v->s, "default") && (!strcmp(key, "review_base_url") || !strcmp(key, "review_api") || !strcmp(key, "key_env") || !strcmp(key, "review_key_env") || !strcmp(key, "system")))) {
         remove_key(j, key); jfree(v);
@@ -1313,6 +1323,8 @@ int main(int argc, char **argv) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)) die("cannot initialize libcurl");
     render_setup(c.color, c.markdown);
     host_interrupt_arm();
+    /* Credentials are never resolved inside --cwd, which may be an untrusted checkout. */
+    if (c.auth_file && !is_absolute(c.auth_file)) { path = path_from(launch_dir, c.auth_file); c.auth_file = path; }
     if (!c.auth_file) {
         path = user_file(HOST_DATA, "auth.json", ".hark-auth.json"); c.auth_file = path;
         if (login && path) { char *data = host_dir(HOST_DATA); if (data && host_exists(path) == 0 && !host_mkdirs(data)) die("cannot create the hark data directory"); free(data); }
@@ -1515,6 +1527,6 @@ done:
     checkpoint(&c, history, latest);
     if (session_saved() && host_tty()) fputs("[saved; continue here with: hark resume]\n", stderr);
     session_end(); jfree(resumed); stop_jobs();
-    inputs_close(&inputs); jfree(owned); store_close(); free(rc_path); free(file_prompt);
+    inputs_close(&inputs); jfree(owned); store_close(); free(rc_path); free(file_prompt); free(launch_dir);
     free(selected_review_model); free(selected_model); free(latest); free(sys); jfree(history); auth_free(&auth); free(path); curl_global_cleanup(); return interrupted ? 130 : ok ? 0 : 1;
 }

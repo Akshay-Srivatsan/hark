@@ -73,7 +73,8 @@ def test_local():
         for key, value in config.items():
             if key not in ('version', 'cwd', 'auth_file', 'prompt_file', 'context_files'):
                 assert saved[key] == value, (key, saved)
-        assert saved['cwd'] == str(work) and saved['auth_file'] == 'auth.json'
+        # A relative auth_file is fixed to the directory current when it was set.
+        assert saved['cwd'] == str(work) and saved['auth_file'] == str(work / 'auth.json')
         assert [v['content'] for v in saved['history']] == [(work / 'notes.txt').read_text()]
         assert 'prompt_file' not in saved and 'context_files' not in saved and 'prompt' not in saved
         assert 'secret-not-saved' not in saved_file.read_text() and 'review-secret' not in saved_file.read_text()
@@ -367,6 +368,9 @@ def test_bad_settings():
         # A rejected /set cwd leaves the working directory where it was.
         invoke(text=f'/set system_files ["rel.txt"]\n/set cwd {other}\n/export out.json\n')
         assert (start / 'out.json').exists() and not (other / 'out.json').exists()
+        # A relative auth_file is pinned when set, so changing directory cannot move it.
+        p = invoke(text=f'/set auth_file creds.json\n/set cwd {other}\n/set auth_file\n')
+        assert json.dumps(str(start / 'creds.json')) in p.stdout.splitlines(), p.stdout
         # In a startup file, a bad setting still stops Hark before running anything else.
         rc = root / '.config' / 'hark'
         rc.mkdir(parents=True)

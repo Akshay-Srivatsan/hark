@@ -24,7 +24,7 @@ The same pattern works for `persistence` and `terminal`. `tests/integration.py` 
 
 Tests must never touch the real user's directories. Every suite sets `HOME` to a temp directory and strips `XDG_*`. Keep doing that in new tests, because the developer's shell exports `XDG_*_HOME`.
 
-Two failures predate the current work and are not regressions: `integration.test_device_auth` (a relative `--auth-file` with `--cwd`), and the `--cwd … --system-file work/system.txt` assertion in `persistence.test_local`. Both come from rc commands running after CLI flags.
+One failure predates the current work and is not a regression: the `--cwd … --system-file work/system.txt` assertion in `persistence.test_local`, caused by rc commands running after CLI flags.
 
 Portability checks: the code targets Linux, BSD, macOS back to 10.4 Tiger (libcurl 7.13.1, gcc 4.0, no `clock_gettime`) and Windows (MinGW). Native code cannot be run for those here, so at least compile-check them:
 

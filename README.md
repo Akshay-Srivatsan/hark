@@ -532,7 +532,10 @@ account must have access to the requested model. Device login is separate from
 OpenAI API billing and API keys; it uses ChatGPT's Codex Responses backend.
 
 Credentials default to `$XDG_DATA_HOME/hark/auth.json` (see Files and directories;
-an existing pre-XDG `~/.hark-auth.json` is still used).
+an existing pre-XDG `~/.hark-auth.json` is still used). A relative `--auth-file` means
+the directory Hark was started from, not `--cwd`, and a relative `/set auth_file` is
+fixed to the current directory when set, so credentials are never read from or
+written into a working directory that changes later.
 Override with `--auth-file PATH` on both commands. POSIX writes use an atomic
 0600 temporary file and rename; reads reject symlinks, non-owner files and group/
 world permissions. Windows writes use a protected owner-rights DACL and atomic
