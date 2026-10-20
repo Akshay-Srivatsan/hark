@@ -509,9 +509,37 @@ is fallible and repository content can influence what a command executes.
 Each command is shown as `$ COMMAND` followed by its outcome, such as `[exit 0]`,
 `[exit 124, timed out]` or `[exit 2, output truncated]`. Its output (stdout and
 stderr, up to `--output-bytes`) goes only to the model, not the terminal; transcripts
-from `/export`, `/save` and sessions still contain it. Commands run one at a time:
-Hark waits for each to exit, time out (`--shell-timeout`) or be interrupted with
-Ctrl-C before continuing. Standard input is `/dev/null` (`NUL` on Windows).
+from `/export`, `/save` and sessions still contain it. A foreground command blocks:
+Hark waits for it to exit, time out or be interrupted with Ctrl-C before continuing.
+The model may give a foreground command a `timeout`; Hark uses the shorter of that
+and `--shell-timeout` (default 120 seconds), so the model can only lower your limit. Standard input is `/dev/null` (`NUL` on
+Windows).
+
+### Background jobs
+
+The model has basic job control, so it can run work in the background and in
+parallel:
+
+| Tool | Effect |
+| --- | --- |
+| `sh` with `background: true` | Start the command as a job and return its ID at once. `timeout` (seconds, default 3600, at most 86400) is chosen by the model |
+| `job_wait` | Wait up to `timeout` seconds (0 just checks; at most `--shell-timeout`) for the listed jobs, or for every job that is running or whose result has not been returned. Returns each job's state, exit status and, once finished, output |
+| `job_list` | List jobs with state (`running`, `exited`, `timed_out`, `killed`), exit status and elapsed time |
+| `job_kill` | Stop a job and every process it started |
+
+Starting several jobs and then waiting for them runs them in parallel. Background
+commands need the same approval as foreground ones. A job shows as `$ COMMAND &`
+and `[job 1 started]`; results appear as `[job 1: exit 0] COMMAND`. Jobs keep
+running between turns and while you are at the prompt, where Hark reports any that
+finished. Ctrl-C interrupts the current response, including a `job_wait`, but not
+background jobs. `/jobs` lists jobs and `/kill JOB` stops one. At most 16 jobs run at
+once (256 per Hark process), each keeping up to `--output-bytes` of output; output
+is available once the job finishes. When Hark exits it stops every job still
+running, and a job also stops if Hark is killed. Jobs are not restored by `hark resume`.
+
+On POSIX each job runs under a small supervisor process in its own process group,
+which captures output and enforces the timeout even while Hark waits for input; on
+Windows each job runs on a thread with a job object that is closed with Hark.
 
 ```sh
 ./hark --model YOUR_MODEL --approval model \
@@ -587,7 +615,8 @@ formats, tool results, human-approval fail-closed behavior without a terminal,
 allow/deny precedence, reviewer errors, Decisions, compaction, malformed batches,
 SSE completion (including metadata-only Codex completion events), context-limit recovery, replay rejection, round limits, and a
 mocked device-login / OAuth refresh flow, model discovery without an initial model,
-runtime setting changes, unconditional approval, and rc persistence.
+runtime setting changes, unconditional approval, rc persistence, and background jobs
+(parallel runs, agent timeouts, kill, listing, argument checks, and cleanup at exit).
 Persistence tests cover all rc configuration keys, precedence, the read-only startup file,
 context/prompt imports, exports, safe transcript continuation, concurrent sessions,
 `hark resume` (locking, per-directory keys, unsafe sessions), and XDG paths with

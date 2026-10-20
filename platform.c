@@ -16,6 +16,7 @@
 #include <sddl.h>
 #include <direct.h>
 #include <io.h>
+#include <process.h>
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -184,6 +185,9 @@ static void capture(char *out, size_t *used, const char *s, size_t n, size_t lim
 #ifndef _WIN32
 static volatile sig_atomic_t terminated;
 static void on_terminate(int sig) { terminated = sig; }
+/* In a job supervisor: stop the command once Hark itself is gone. */
+static pid_t supervised_by;
+static int abandoned(void) { return supervised_by && getppid() != supervised_by; }
 #ifdef CLOCK_MONOTONIC
 static double now(void) { struct timespec t; if (clock_gettime(CLOCK_MONOTONIC, &t)) return (double)time(NULL); return (double)t.tv_sec + (double)t.tv_nsec / 1e9; }
 #else
@@ -219,8 +223,8 @@ char *host_run(const char *shell, const char *command, unsigned seconds, size_t 
         if (rounds <= 16 && n == 0) eof = 1;
         if (!done) { r = waitpid(pid, &st, WNOHANG); if (r == pid || (r < 0 && errno != EINTR)) done = 1; }
         if (done && eof) break;
-        if (terminated || interrupt_flag || now() >= deadline) {
-            stopped = terminated || interrupt_flag; *timed = !stopped;
+        if (terminated || interrupt_flag || abandoned() || now() >= deadline) {
+            stopped = terminated || interrupt_flag || abandoned(); *timed = !stopped;
             (void)kill(-pid, SIGKILL); if (!done) while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
             break;
         }
@@ -232,6 +236,75 @@ char *host_run(const char *shell, const char *command, unsigned seconds, size_t 
     if (terminated) { int sig = terminated; free(out); raise(sig); exit(128 + sig); }
     *status = *timed ? 124 : stopped ? 130 : WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
     return out;
+}
+/* A background job is a supervisor process running host_run, so its output is
+ * drained and its timeout enforced even while Hark waits at the prompt. The
+ * supervisor sends "status timed truncated\n" and the output over a pipe. */
+double host_seconds(void) { return now(); }
+struct HostJob { pid_t pid; int fd, done, killed, status, timed, truncated; char *buf; size_t used, limit; };
+static void write_all(int fd, const char *s, size_t n) {
+    while (n) { ssize_t k = write(fd, s, n); if (k < 0 && errno == EINTR) continue; if (k <= 0) return; s += k; n -= (size_t)k; }
+}
+HostJob *host_job_start(const char *shell, const char *command, unsigned seconds, size_t limit) {
+    int fd[2]; pid_t pid, parent = getpid(); HostJob *j;
+    if (pipe(fd)) return NULL;
+    fflush(NULL); pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return NULL; }
+    if (!pid) {
+        char head[64], *out; int st, timed, truncated;
+        /* Its own process group: terminal ^C interrupts Hark, not background jobs. */
+        close(fd[0]); (void)setpgid(0, 0); (void)signal(SIGINT, SIG_DFL);
+        (void)fcntl(fd[1], F_SETFD, FD_CLOEXEC); /* The shell must not hold the result pipe open. */
+        interrupt_flag = 0; supervised_by = parent;
+        out = host_run(shell, command, seconds, limit, &st, &timed, &truncated);
+        sprintf(head, "%d %d %d\n", st, timed, truncated);
+        write_all(fd[1], head, strlen(head)); write_all(fd[1], out, strlen(out)); _exit(0);
+    }
+    close(fd[1]); (void)setpgid(pid, pid);
+    (void)fcntl(fd[0], F_SETFD, FD_CLOEXEC); (void)fcntl(fd[0], F_SETFL, O_NONBLOCK);
+    j = xmalloc(sizeof *j); memset(j, 0, sizeof *j);
+    j->pid = pid; j->fd = fd[0]; j->limit = limit + 64; j->buf = xmalloc(j->limit + 1); j->buf[0] = 0; j->status = -1;
+    return j;
+}
+static void job_finish(HostJob *j) {
+    int st; char *end; long v[3]; int i; const char *p = j->buf;
+    close(j->fd); j->fd = -1; while (waitpid(j->pid, &st, 0) < 0 && errno == EINTR) {}
+    j->done = 1; j->buf[j->used] = 0;
+    for (i = 0; i < 3; i++) { v[i] = strtol(p, &end, 10); if (end == p) break; p = end; }
+    /* No result line means the supervisor was killed. */
+    if (i < 3 || *p != '\n') { j->killed = 1; j->status = 137; j->buf[0] = 0; return; }
+    j->status = (int)v[0]; j->timed = v[1] != 0; j->truncated = v[2] != 0;
+    memmove(j->buf, p + 1, strlen(p + 1) + 1);
+}
+int host_job_wait(HostJob *j, unsigned ms) {
+    double deadline = now() + ms / 1000.0;
+    while (!j->done) {
+        struct pollfd p; char block[4096]; ssize_t n; double left;
+        while ((n = read(j->fd, block, sizeof block)) > 0) {
+            size_t take = (size_t)n < j->limit - j->used ? (size_t)n : j->limit - j->used;
+            memcpy(j->buf + j->used, block, take); j->used += take;
+        }
+        if (n == 0) { job_finish(j); break; }
+        left = deadline - now();
+        if (left <= 0 || interrupt_flag) break;
+        p.fd = j->fd; p.events = POLLIN; p.revents = 0; (void)poll(&p, 1, left < 0.1 ? (int)(left * 1000) + 1 : 100);
+    }
+    return j->done;
+}
+void host_job_kill(HostJob *j) {
+    if (j->done) return;
+    /* The supervisor kills the command's process group on SIGTERM. */
+    (void)kill(j->pid, SIGTERM);
+    { unsigned i; for (i = 0; i < 20 && !host_job_wait(j, 100); i++) {} }
+    if (!j->done) { (void)kill(-j->pid, SIGKILL); (void)kill(j->pid, SIGKILL); while (!host_job_wait(j, 100)) {} }
+    j->killed = 1;
+}
+const char *host_job_result(const HostJob *j, int *status, int *timed, int *truncated, int *killed) {
+    *status = j->status; *timed = j->timed; *truncated = j->truncated; *killed = j->killed; return j->done ? j->buf : NULL;
+}
+void host_job_free(HostJob *j) {
+    if (!j) return;
+    host_job_kill(j); free(j->buf); free(j);
 }
 char *host_read_private(const char *path, size_t limit) {
     struct stat st; int fd; FILE *f; char *s; size_t n;
@@ -269,7 +342,8 @@ static char *winquote(const char *s) {
     }
     while (slash) { q[k++] = '\\'; q[k++] = '\\'; slash--; } q[k++] = '"'; q[k] = 0; return q;
 }
-char *host_run(const char *shell, const char *command, unsigned seconds, size_t limit, int *status, int *timed, int *truncated) {
+/* CANCEL is a job's kill flag; foreground commands (NULL) stop on ^C instead. */
+static char *run_command(const char *shell, const char *command, unsigned seconds, size_t limit, int *status, int *timed, int *truncated, volatile LONG *cancel) {
     SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE}; STARTUPINFOA si; PROCESS_INFORMATION pi;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION ji; HANDLE rd = NULL, wr = NULL, input = INVALID_HANDLE_VALUE, job = NULL;
     char *a = winquote(shell), *b = NULL, *line = NULL, block[4096], *out = xmalloc(limit + 1); size_t used = 0;
@@ -300,7 +374,7 @@ char *host_run(const char *shell, const char *command, unsigned seconds, size_t 
         if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
             if (!PeekNamedPipe(rd, NULL, 0, NULL, &available, NULL) || !available) break;
         }
-        if (interrupt_flag) { stopped = 1; TerminateJobObject(job, 130); break; }
+        if (cancel ? *cancel : interrupt_flag) { stopped = 1; TerminateJobObject(job, 130); break; }
         if ((DWORD)(GetTickCount() - start) >= seconds * 1000UL) { *timed = 1; TerminateJobObject(job, 124); break; }
         Sleep(20);
     }
@@ -316,6 +390,44 @@ cleanup:
     if (wr) CloseHandle(wr);
     if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
     free(line); return out;
+}
+double host_seconds(void) { return GetTickCount() / 1000.0; }
+char *host_run(const char *shell, const char *command, unsigned seconds, size_t limit, int *status, int *timed, int *truncated) {
+    return run_command(shell, command, seconds, limit, status, timed, truncated, NULL);
+}
+/* A background job runs on its own thread; its job object dies with Hark. */
+struct HostJob { HANDLE thread; volatile LONG cancel; char *shell, *command, *out; unsigned seconds; size_t limit; int done, killed, status, timed, truncated; };
+static unsigned __stdcall job_thread(void *arg) {
+    HostJob *j = arg;
+    j->out = run_command(j->shell, j->command, j->seconds, j->limit, &j->status, &j->timed, &j->truncated, &j->cancel);
+    return 0;
+}
+HostJob *host_job_start(const char *shell, const char *command, unsigned seconds, size_t limit) {
+    HostJob *j = xmalloc(sizeof *j); memset(j, 0, sizeof *j);
+    j->shell = xstrdup(shell); j->command = xstrdup(command); j->seconds = seconds; j->limit = limit; j->status = -1;
+    j->thread = (HANDLE)_beginthreadex(NULL, 0, job_thread, j, 0, NULL);
+    if (!j->thread) { free(j->shell); free(j->command); free(j); return NULL; }
+    return j;
+}
+int host_job_wait(HostJob *j, unsigned ms) {
+    DWORD start = GetTickCount();
+    while (!j->done) {
+        DWORD left = (DWORD)(GetTickCount() - start) >= ms ? 0 : ms - (DWORD)(GetTickCount() - start);
+        if (WaitForSingleObject(j->thread, left < 100 ? left : 100) == WAIT_OBJECT_0) { j->done = 1; j->killed = j->cancel != 0; break; }
+        if (!left || interrupt_flag) break;
+    }
+    return j->done;
+}
+void host_job_kill(HostJob *j) {
+    if (j->done) return;
+    InterlockedExchange(&j->cancel, 1); WaitForSingleObject(j->thread, INFINITE); j->done = 1; j->killed = 1;
+}
+const char *host_job_result(const HostJob *j, int *status, int *timed, int *truncated, int *killed) {
+    *status = j->status; *timed = j->timed; *truncated = j->truncated; *killed = j->killed; return j->done ? j->out : NULL;
+}
+void host_job_free(HostJob *j) {
+    if (!j) return;
+    host_job_kill(j); CloseHandle(j->thread); free(j->out); free(j->shell); free(j->command); free(j);
 }
 char *host_read_private(const char *path, size_t limit) {
     HANDLE f; DWORD size, n; char *s;

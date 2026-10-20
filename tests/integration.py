@@ -8,22 +8,25 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BINARY = str(pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else './hark').resolve())
 
 
 def response(text=None, calls=None, chat=False):
+    # A call is (call_id, arguments) for sh, or (call_id, arguments, tool name).
+    calls = [(c[0], c[1], c[2] if len(c) > 2 else 'sh') for c in calls or []]
     if chat:
         m = {'role': 'assistant', 'content': text}
         if calls:
-            m['tool_calls'] = [{'id': cid, 'type': 'function', 'function': {'name': 'sh', 'arguments': args}} for cid, args in calls]
+            m['tool_calls'] = [{'id': cid, 'type': 'function', 'function': {'name': name, 'arguments': args}} for cid, args, name in calls]
         return {'choices': [{'message': m, 'finish_reason': 'tool_calls' if calls else 'stop'}]}
     out = []
     if text is not None:
         out.append({'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]})
-    for cid, args in calls or []:
-        out.append({'type': 'function_call', 'call_id': cid, 'name': 'sh', 'arguments': args})
+    for cid, args, name in calls:
+        out.append({'type': 'function_call', 'call_id': cid, 'name': name, 'arguments': args})
     return {'status': 'completed', 'output': out, 'error': None}
 
 
@@ -397,6 +400,82 @@ def test_provider_errors():
     assert p.returncode == 1 and 'provider request failed (HTTP 422): ' + 'x' * 400 + '...' in p.stderr and 'x' * 401 not in p.stderr, p.stderr
 
 
+def test_jobs():
+    for chat in (False, True):
+        state = {'n': 0}
+        def call(name, cid, **args):
+            return (cid, json.dumps(args), name)
+        def handle(path, body, headers):
+            history = body['messages' if chat else 'input']
+            outputs = {}
+            for v in history:
+                if chat and v.get('role') == 'tool':
+                    outputs[v['tool_call_id']] = json.loads(v['content'])
+                elif not chat and v.get('type') == 'function_call_output':
+                    outputs[v['call_id']] = json.loads(v['output'])
+            names = [t.get('function', t)['name'] for t in body['tools']]
+            assert names == ['sh', 'job_list', 'job_wait', 'job_kill'], names
+            state['n'] += 1
+            n = state['n']
+            if n == 1:
+                # Two background jobs run in parallel.
+                return 200, response(calls=[call('sh', 'a', command='sleep 1; echo A', background=True, timeout=None),
+                                            call('sh', 'b', command='sleep 1; echo B', background=True, timeout=None)], chat=chat), False
+            if n == 2:
+                assert outputs['a']['job_id'] == 1 and outputs['b']['job_id'] == 2 and outputs['a']['state'] == 'running'
+                state['started'] = time.monotonic()
+                return 200, response(calls=[call('job_wait', 'w', ids=None, timeout=10)], chat=chat), False
+            if n == 3:
+                jobs = {j['id']: j for j in outputs['w']['jobs']}
+                assert time.monotonic() - state['started'] < 1.8, 'background jobs must run in parallel'
+                assert jobs[1]['state'] == 'exited' and jobs[1]['exit_status'] == 0 and jobs[1]['output'] == 'A\n', jobs
+                assert jobs[2]['output'] == 'B\n', jobs
+                # An agent-chosen timeout, a job to kill, and one left running at exit.
+                return 200, response(calls=[call('sh', 't', command='sleep 30', background=True, timeout=1),
+                                            call('sh', 'k', command='sleep 30', background=True, timeout=None),
+                                            call('sh', 's', command='echo $$ > survivor.pid; exec sleep 60', background=True, timeout=600)], chat=chat), False
+            if n == 4:
+                assert outputs['t']['timeout_seconds'] == 1 and outputs['k']['timeout_seconds'] == 3600
+                return 200, response(calls=[call('job_wait', 'wt', ids=[3], timeout=5), call('job_kill', 'kk', id=4), call('job_list', 'l')], chat=chat), False
+            if n == 5:
+                assert outputs['wt']['jobs'][0]['state'] == 'timed_out', outputs['wt']
+                assert outputs['kk']['job']['state'] == 'killed', outputs['kk']
+                states = {j['id']: j['state'] for j in outputs['l']['jobs']}
+                assert states == {1: 'exited', 2: 'exited', 3: 'timed_out', 4: 'killed', 5: 'running'}, states
+                assert 'output' not in outputs['l']['jobs'][0], 'job_list reports state only'
+                # Foreground commands use the shorter of the agent's and the user's limit.
+                state['fg'] = time.monotonic()
+                return 200, response(calls=[call('sh', 'f', command='echo fg', background=None, timeout=None),
+                                            call('sh', 'ft', command='sleep 5', background=False, timeout=1),
+                                            call('sh', 'fl', command='echo long', background=False, timeout=999),
+                                            call('job_wait', 'wl', ids=None, timeout=999),
+                                            call('job_kill', 'kx', id=99),
+                                            call('sh', 'x', command='echo x', extra=1)], chat=chat), False
+            if n == 6:
+                assert outputs['f']['exit_status'] == 0 and outputs['f']['output'] == 'fg\n' and outputs['f']['timeout_seconds'] == 20
+                assert outputs['ft']['timed_out'] and outputs['ft']['exit_status'] == 124 and outputs['ft']['timeout_seconds'] == 1
+                assert time.monotonic() - state['fg'] < 4, 'the agent timeout applies in the foreground'
+                assert outputs['fl']['timeout_seconds'] == 20 and outputs['fl']['output'] == 'long\n', 'the user limit caps the agent'
+                assert 'job_wait takes' in outputs['wl']['error']
+                assert 'job_kill takes' in outputs['kx']['error'] and 'sh takes' in outputs['x']['error']
+                return 200, response('done', chat=chat), False
+            raise AssertionError('unexpected request')
+        p, req, files = run(handle, ['--approval', 'allow', '--shell-timeout', '20'] + (['--api', 'chat'] if chat else []))
+        assert p.returncode == 0 and state['n'] == 6, (p.stdout, p.stderr)
+        assert '$ sleep 1; echo A &\n[job 1 started]' in p.stdout and '[job 1: exit 0] sleep 1; echo A' in p.stdout, p.stdout
+        assert '[job 3: timed out after 1s]' in p.stdout and '[job 4: killed]' in p.stdout and '[stopping 1 background job]' in p.stderr
+        # Hark kills jobs still running when it exits.
+        pid = int(files['survivor.pid'])
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            assert time.monotonic() < deadline, 'background job survived Hark'
+            time.sleep(.05)
+
+
 def test_device_auth():
     import base64
     import shlex
@@ -535,7 +614,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

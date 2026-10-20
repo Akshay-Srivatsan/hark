@@ -7,7 +7,7 @@
 static void complete_commands(ic_completion_env_t *env, const char *prefix) {
     static const char *commands[] = {
         "/approval", "/approval model", "/approval ask", "/approval deny", "/approval allow",
-        "/review-model ", "/review-model default", "/models", "/model ", "/speed ", "/thinking ", "/status", "/help",
+        "/review-model ", "/review-model default", "/models", "/model ", "/speed ", "/thinking ", "/status", "/jobs", "/kill ", "/help",
         "/compact", "/reset", "/quit", "/set ", "/export ", "/context ", "/save ", "/include ", "/import ", "/prompt ",
         "/speed auto", "/speed standard", "/speed fast", "/speed flex", "/speed ultrafast",
         "/thinking default", "/thinking none", "/thinking minimal", "/thinking low",

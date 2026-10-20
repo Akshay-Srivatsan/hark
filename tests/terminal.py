@@ -106,6 +106,12 @@ def test_interrupt(line_edit=True):
             return 200, response(calls=[('slow', '{"command":"sleep 30; echo finished"}'), ('next', '{"command":"echo never"}')]), False
         if users[-1] == 'ask':
             return 200, response(calls=[('asked', '{"command":"echo asked"}')]), False
+        finished = body['input'][-1].get('type') == 'function_call_output'
+        if users[-1] == 'background' and not finished:
+            return 200, response(calls=[('bg', '{"command":"sleep 30","background":true,"timeout":null}'),
+                                        ('wait', '{"ids":null,"timeout":20}', 'job_wait')]), False
+        if users[-1] == 'quick' and not finished:
+            return 200, response(calls=[('quick', '{"command":"sleep 0.3","background":true,"timeout":null}')]), False
         return 200, response('after ' + users[-1]), False
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     server.handler, server.requests, server.errors = handler, [], []
@@ -181,6 +187,28 @@ def test_interrupt(line_edit=True):
                 read_until(b'after kept')
                 read_until(b'> ')
                 assert not any('discard me' in json.dumps(h) for h in seen)
+            # ^C during job_wait stops waiting; the background job keeps running until killed.
+            os.write(master, b'background\r')
+            read_until(b'[waiting up to 20s for job 1]')
+            time.sleep(.3)
+            os.write(master, b'\x03')
+            read_until(b'[interrupted]')
+            read_until(b'> ')
+            os.write(master, b'/jobs\r')
+            read_until(b'[job 1: running for ')
+            read_until(b'> ')
+            os.write(master, b'/kill 1\r')
+            read_until(b'[job 1: killed] sleep 30')
+            read_until(b'> ')
+            # A job that finishes between prompts is reported before the next one.
+            os.write(master, b'quick\r')
+            read_until(b'[job 2 started]')
+            read_until(b'after quick')
+            read_until(b'> ')
+            time.sleep(.8)
+            os.write(master, b'/status\r')
+            read_until(b'[finished job 2: exit 0] sleep 0.3')
+            read_until(b'> ')
             # ^C at a human approval prompt denies and interrupts; the session continues.
             os.write(master, b'/approval ask\r')
             read_until(b'approval: ask')

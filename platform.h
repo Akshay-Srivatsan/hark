@@ -22,6 +22,7 @@ char *host_cwd(void);
 int host_chdir(const char *path);
 int host_tty(void);
 void host_sleep(unsigned seconds);
+double host_seconds(void); /* Monotonic where available; for measuring intervals. */
 /* While armed, ^C sets a flag instead of terminating Hark: requests, shell
  * commands and sleeps stop early, and blocking terminal reads return. */
 void host_interrupt_arm(void);
@@ -30,6 +31,16 @@ int host_interrupted(void);
 void host_interrupt_clear(void);
 char *host_run(const char *shell, const char *command, unsigned seconds,
                size_t limit, int *status, int *timed_out, int *truncated);
+/* Background jobs: like host_run, but asynchronous. A job keeps running, with its
+ * output captured and timeout enforced, until it exits, times out or is killed.
+ * host_job_wait waits up to MS milliseconds (returning early on ^C) and returns 1
+ * once the job has finished; host_job_result then gives its output and status. */
+typedef struct HostJob HostJob;
+HostJob *host_job_start(const char *shell, const char *command, unsigned seconds, size_t limit);
+int host_job_wait(HostJob *job, unsigned ms);
+const char *host_job_result(const HostJob *job, int *status, int *timed_out, int *truncated, int *killed);
+void host_job_kill(HostJob *job);
+void host_job_free(HostJob *job); /* Kills the job if it is still running. */
 char *host_read_private(const char *path, size_t limit);
 char *host_read_secret(const char *path); /* NULL on missing/unsafe file */
 int host_write_secret(const char *path, const char *text);
