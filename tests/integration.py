@@ -602,6 +602,24 @@ def test_streaming():
                     assert [c['id'] for c in sent['tool_calls']] == ['c1', 'c2'] and sent['tool_calls'][0]['function']['name'] == 'sh'
         finally:
             server.shutdown(); server.server_close()
+    # llama.cpp's Responses streams omit output_index; items arrive in order.
+    def llama(body):
+        if body['input'][-1].get('type') == 'function_call_output':
+            return responses_text('ran it')
+        thought = {'type': 'reasoning', 'id': 'rs', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': 'plan'}]}
+        call = {'type': 'function_call', 'call_id': 'c1', 'name': 'sh', 'arguments': json.dumps({'command': 'printf ok > result'})}
+        return [sse({'type': 'response.reasoning_text.delta', 'delta': 'plan'}),
+                sse({'type': 'response.output_item.done', 'item': thought}),
+                sse({'type': 'response.output_item.done', 'item': call}),
+                sse({'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [thought, call]}})]
+    server = stream_server(llama)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = subprocess.run(stream_args(server, False, '--', 'go'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=20)
+            assert p.returncode == 0 and pathlib.Path(tmp, 'result').read_text() == 'ok' and 'ran it' in p.stdout, (p.stdout, p.stderr)
+            assert [v.get('type') for v in server.requests[1]['input'][1:3]] == ['reasoning', 'function_call']
+    finally:
+        server.shutdown(); server.server_close()
     # A chat stream that ends before finish_reason runs nothing; C1 controls in deltas are filtered.
     def truncated(body):
         return [chat_chunk({'content': 'X\u009b31m'}), chat_chunk({'tool_calls': [{'index': 0, 'id': 'c1', 'function': {'name': 'sh', 'arguments': '{"command": "printf bad > result"}'}}]})]

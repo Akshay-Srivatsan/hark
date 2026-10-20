@@ -162,7 +162,7 @@ Json *http_json(const Http *r, const char *secret) {
 }
 /* A completed item can carry text, reasoning, or a function call. Codex's
  * final response often has metadata only, so never discard item.done events. */
-typedef struct { Json *items, *result; size_t count; } ResponsesStream;
+typedef struct { Json *items, *result; size_t count, done; } ResponsesStream;
 static int stream_event(const char *data, void *ctx) {
     ResponsesStream *rs = ctx; Json *items = rs->items, **result = &rs->result; size_t *count = &rs->count;
     Json *event, *index, *item; char *end; unsigned long n;
@@ -170,11 +170,16 @@ static int stream_event(const char *data, void *ctx) {
     event = jparse(data); if (!event || event->type != J_OBJ) { jfree(event); return 0; }
     if (jis(event, "type", "error") || jis(event, "type", "response.failed") || jis(event, "type", "response.incomplete")) { jfree(event); return 0; }
     if (jis(event, "type", "response.output_item.done")) {
+        char key[32];
         index = jget(event, "output_index"); item = jget(event, "item");
-        if (!index || index->type != J_NUM || index->s[0] < '0' || index->s[0] > '9' || !item || item->type != J_OBJ) { jfree(event); return 0; }
-        n = strtoul(index->s, &end, 10);
-        if (*end || n >= 1024) { jfree(event); return 0; }
-        jset(items, index->s, jcopy(item)); if (n + 1 > *count) *count = (size_t)n + 1;
+        if (!item || item->type != J_OBJ) { jfree(event); return 0; }
+        /* llama.cpp omits output_index; its items arrive in output order. */
+        if (!index) n = (unsigned long)rs->done;
+        else if (index->type != J_NUM || index->s[0] < '0' || index->s[0] > '9') { jfree(event); return 0; }
+        else { n = strtoul(index->s, &end, 10); if (*end) { jfree(event); return 0; } }
+        if (n >= 1024) { jfree(event); return 0; }
+        snprintf(key, sizeof key, "%lu", n); rs->done++;
+        jset(items, key, jcopy(item)); if (n + 1 > *count) *count = (size_t)n + 1;
     } else if (jis(event, "type", "response.completed")) {
         Json *response = jget(event, "response");
         if (!response || response->type != J_OBJ || *result) { jfree(event); return 0; }
