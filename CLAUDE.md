@@ -48,6 +48,7 @@ x86_64-w64-mingw32-gcc -std=c99 -Wall -Wextra -pedantic -c platform.c -o /dev/nu
 
 - **Precedence:** CLI flags and environment variables are parsed first (`options()`). The rc file (`$XDG_CONFIG_HOME/hark/harkrc`, falling back to legacy `~/.harkrc`) is then replayed as ordinary input lines, so rc commands override flags.
 - **`/set` rebuilds the whole config:** `set_option()` serializes the current state with `configuration()`, applies the key, and re-runs `options()` with no CLI arguments. Any `Config` field missing from `configuration()` silently resets on every `/set`. Process-wide state such as the active session or job table lives in module statics for this reason.
+- **Recoverable config errors:** during `set_option()`, `die()` long-jumps back through `config_recovery`, so a bad setting is rejected, not fatal. Call `die()`/`bad_setting()` for validation in `options()` and its helpers. Do not change state (history, cwd) before the point where a rebuild can still fail, or undo it in the recovery path.
 - **Input sources:** the main loop in `main()` takes input from the rc, `--include` files, the initial prompt and the terminal (Isocline, or plain stdio with `--no-line-edit`). Slash commands from files run exactly like terminal input.
 
 ### Turn loop and tools (`turn()`)

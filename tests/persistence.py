@@ -337,6 +337,44 @@ def test_instructions():
         server.shutdown(); server.server_close(); thread.join()
 
 
+def test_bad_settings():
+    with tempfile.TemporaryDirectory(prefix='hark-bad-settings-') as temp:
+        root = pathlib.Path(temp)
+        start, other = root / 'start', root / 'other'
+        start.mkdir(); other.mkdir()
+        (start / 'rel.txt').write_text('Relative system file.')
+        def invoke(*args, text=''):
+            return subprocess.run([BINARY, *args], cwd=start, input=text, text=True, capture_output=True, env=environment(root), timeout=10)
+        bad = {
+            '/set color true': 'color must be always/yes/force',
+            '/set http_timeout abc': 'http_timeout must be a whole number from 1 to 86400',
+            '/set http_timeout 0': 'http_timeout must be a whole number from 1 to 86400',
+            '/set allow 7': 'allow must be a string or a JSON array of strings',
+            '/set deny [7]': 'deny must be a JSON array of strings',
+            '/set no_line_edit maybe': 'no_line_edit must be true or false',
+            '/set base_url ftp://example.org': 'provider URL must start with',
+            '/set typo 1': 'unknown setting: typo',
+            '/set system ["a", "b"]': 'system must be text',
+            '/set system_files ["missing.txt"]': 'cannot read system file',
+        }
+        # Each bad /set is reported and rejected; the session continues with the old values.
+        p = invoke(text=''.join(line + '\n' for line in bad) + '/set no_line_edit yes\n/set model 7\n/set http_timeout\n/set no_line_edit\n/status\n')
+        for line, message in bad.items():
+            assert message in p.stderr, (line, p.stderr)
+        lines = p.stdout.splitlines()
+        assert 'model: 7' in lines and lines[:2] == ['300', 'true'], p.stdout
+        assert p.returncode == 1, 'a rejected command still makes a scripted run fail'
+        # A rejected /set cwd leaves the working directory where it was.
+        invoke(text=f'/set system_files ["rel.txt"]\n/set cwd {other}\n/export out.json\n')
+        assert (start / 'out.json').exists() and not (other / 'out.json').exists()
+        # In a startup file, a bad setting still stops Hark before running anything else.
+        rc = root / '.config' / 'hark'
+        rc.mkdir(parents=True)
+        (rc / 'harkrc').write_text('/set color true\n/model never-reached\n')
+        p = invoke(text='/status\n')
+        assert p.returncode == 1 and 'color must be' in p.stderr and 'never-reached' not in p.stdout, (p.stdout, p.stderr)
+
+
 def test_include_import():
     with tempfile.TemporaryDirectory(prefix='hark-include-') as temp:
         root = pathlib.Path(temp)
@@ -471,6 +509,8 @@ if __name__ == '__main__':
     print('resume tests passed')
     test_instructions()
     print('instruction file tests passed')
+    test_bad_settings()
+    print('bad setting tests passed')
     test_include_import()
     print('include/import distinction tests passed')
     test_concurrent_saves()

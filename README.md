@@ -306,8 +306,17 @@ permissions.
 `/set KEY VALUE` exposes every runtime setting. Hyphens and underscores in keys
 are interchangeable. Strings can be unquoted text (the whole remaining line)
 or JSON-quoted strings, which support escaped newlines. Numbers, booleans and
-arrays use JSON literals. `/set KEY` displays a value; `/set` displays the
-current configuration. No shell evaluates these values.
+arrays use JSON literals; a number or boolean given for a text setting is used as
+text, booleans also accept `yes`/`no`/`on`/`off`, and a list of one item may be a
+plain string. `/set KEY` displays a value; `/set` displays the current
+configuration. No shell evaluates these values.
+
+A bad `/set` (an unknown key, a wrong type, an out-of-range number, an invalid URL
+or a missing system file) is reported, for example `hark: http_timeout must be a
+whole number from 1 to 86400`, and rejected: the previous settings stay, including
+the working directory. A scripted run still exits with status 1 afterwards. In
+`harkrc` or an included file, an error stops Hark before later lines run, so a
+broken startup file never leaves a partial configuration.
 
 | Settings | Values / purpose |
 | --- | --- |
