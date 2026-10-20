@@ -131,6 +131,18 @@ def test_tools():
     for mode in ('stream-failed', 'stream-truncated', 'stream-incomplete'):
         p, req, files = run(tool_round(sse=mode), ['--approval', 'allow'])
         assert p.returncode == 1 and not files and len(req) == 1, (mode, p.stderr)
+    # The terminal shows the command and its exit status; only the model sees output.
+    seen = {}
+    def quiet(path, body, headers):
+        if not seen:
+            seen['n'] = 1
+            return 200, response(calls=[('loud', json.dumps({'command': "printf 'MARK%s\\n' ER-OUT; printf 'MARK%s\\n' ER-ERR >&2; exit 3"}))]), False
+        seen['result'] = json.loads(body['input'][-1]['output'])
+        return 200, response('finished'), False
+    p, _, _ = run(quiet, ['--approval', 'allow'])
+    assert p.returncode == 0 and 'MARKER' not in p.stdout + p.stderr, p.stdout
+    assert "$ printf 'MARK%s\\n' ER-OUT; printf 'MARK%s\\n' ER-ERR >&2; exit 3\n[exit 3]\n" in p.stdout, p.stdout
+    assert seen['result']['exit_status'] == 3 and 'MARKER-OUT' in seen['result']['output'] and 'MARKER-ERR' in seen['result']['output']
     # Whole-command glob must not accidentally act as a prefix allow-list.
     p, _, files = run(tool_round(command='echo safe; printf bad > result', expected='denied'), ['--approval', 'ask', '--allow', 'echo safe'])
     assert p.returncode == 0 and not files

@@ -506,6 +506,13 @@ not an isolation mechanism. Shell commands run with the harness's permissions
 and inherited environment. There is no filesystem/network sandbox. Model review
 is fallible and repository content can influence what a command executes.
 
+Each command is shown as `$ COMMAND` followed by its outcome, such as `[exit 0]`,
+`[exit 124, timed out]` or `[exit 2, output truncated]`. Its output (stdout and
+stderr, up to `--output-bytes`) goes only to the model, not the terminal; transcripts
+from `/export`, `/save` and sessions still contain it. Commands run one at a time:
+Hark waits for each to exit, time out (`--shell-timeout`) or be interrupted with
+Ctrl-C before continuing. Standard input is `/dev/null` (`NUL` on Windows).
+
 ```sh
 ./hark --model YOUR_MODEL --approval model \
   --review-model REVIEW_MODEL --review-api responses \

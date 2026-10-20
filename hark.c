@@ -582,7 +582,10 @@ static char *run_tool(Config *c, const char *name, const char *args, const char 
         }
         else {
             out = host_run(c->shell, cmd->s, c->shell_timeout, c->output_bytes, &st, &timed, &truncated);
-            host_print(out); if (*out && out[strlen(out) - 1] != '\n') puts("");
+            /* Show only the outcome; the model still receives the full output. */
+            if (st < 0) { fputs("[shell failed: ", stdout); host_print(out); puts("]"); }
+            else printf("[exit %d%s%s]\n", st, timed ? ", timed out" : host_interrupted() ? ", interrupted" : "", truncated ? ", output truncated" : "");
+            fflush(stdout);
             jset(res, "output", jstr(out)); free(out);
             if (st >= 0) jset(res, "exit_status", jnum((unsigned long)st)); else jset(res, "exit_status", jnew(J_NULL));
             jset(res, "timed_out", jbool(timed)); jset(res, "truncated", jbool(truncated));
