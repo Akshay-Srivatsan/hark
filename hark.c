@@ -44,7 +44,7 @@ typedef struct {
     const char *context_files[MAX_RULES], *include_files[MAX_RULES], *instruction_files[MAX_RULES], *system_files[MAX_RULES];
     size_t ncontext, ninclude, ninstruction, nsystem;
     size_t compact_bytes, output_bytes; unsigned steps, shell_timeout;
-    int chatgpt, review_set, review_base_set, review_api_set, list_models, no_line_edit, chatgpt_explicit, resume, no_session;
+    int chatgpt, review_set, review_base_set, review_api_set, list_models, no_line_edit, chatgpt_explicit, resume, no_session, stream;
 } Config;
 /* General guidance, replaceable with /set system. */
 static const char default_guidance[] =
@@ -165,7 +165,7 @@ static char *preload(int argc, char **argv, char **rc_path) {
         if (a[0] != '-') break;
         if (!strcmp(a, "--help") || !strcmp(a, "-h") || !strcmp(a, "--version")) { skip = 1; break; }
         if (!strcmp(a, "--no-rc")) { disabled = 1; continue; }
-        if (!strcmp(a, "--chatgpt") || !strcmp(a, "--no-line-edit") || !strcmp(a, "--list-models") || !strcmp(a, "--no-session")) continue;
+        if (!strcmp(a, "--chatgpt") || !strcmp(a, "--no-line-edit") || !strcmp(a, "--list-models") || !strcmp(a, "--no-session") || !strcmp(a, "--no-stream")) continue;
         if (i + 1 == argc) break;
         if (!strcmp(a, "--cwd")) directory = argv[i + 1];
         if (!strcmp(a, "--rc")) file = argv[i + 1];
@@ -215,6 +215,7 @@ static void usage(void) {
          "  --http-timeout SEC     Default 300\n"
          "  --system-file PATH     Append trusted instructions from file (repeatable)\n"
          "  --no-line-edit         Use plain terminal input\n"
+         "  --no-stream            Show replies when complete instead of as they arrive\n"
          "  --rc PATH              Startup Hark input file (default $XDG_CONFIG_HOME/hark/harkrc)\n"
          "  --no-rc                Ignore the rc file\n"
          "  --no-session           Do not save this conversation for hark resume\n"
@@ -231,7 +232,7 @@ static void validate_config(const Json *saved) {
     static const char *const keys[] = {
         "version", "base_url", "api", "model", "speed", "thinking", "key_env", "chatgpt",
         "codex_client_version", "http_timeout", "shell", "approval", "policy", "system_files", "system", "instruction_files",
-        "no_line_edit", "compact_bytes", "output_bytes", "max_steps", "shell_timeout",
+        "no_line_edit", "stream", "compact_bytes", "output_bytes", "max_steps", "shell_timeout",
         "review_model", "review_base_url", "review_api", "review_key_env", "auth_file",
         "cwd", "allow", "deny",
         "history", "latest_user", NULL
@@ -252,7 +253,7 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
     c->shell = saved_text(saved, "shell", host_shell()); c->approval = saved_text(saved, "approval", "model"); c->policy = saved_text(saved, "policy", "");
     c->key_env = saved_text(saved, "key_env", NULL); saved_rules(saved, "system_files", c->system_files, &c->nsystem);
     c->system = saved_text(saved, "system", NULL); saved_rules(saved, "instruction_files", c->instruction_files, &c->ninstruction);
-    c->no_line_edit = saved_bool(saved, "no_line_edit", 0);
+    c->no_line_edit = saved_bool(saved, "no_line_edit", 0); c->stream = saved_bool(saved, "stream", 1);
     c->chatgpt = saved_bool(saved, "chatgpt", 0);
     if (environment && (getenv("HARK_BASE_URL") || getenv("HARK_API"))) c->chatgpt = 0;
     c->compact_bytes = saved_number(saved, "compact_bytes", 196608, 0, 16UL * 1024UL * 1024UL);
@@ -278,6 +279,7 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
         if (!strcmp(arg, "--version")) { puts("hark " VERSION); exit(0); }
         if (!strcmp(arg, "--list-models")) { c->list_models = 1; continue; }
         if (!strcmp(arg, "--no-line-edit")) { c->no_line_edit = 1; continue; }
+        if (!strcmp(arg, "--no-stream")) { c->stream = 0; continue; }
         if (!strcmp(arg, "--no-session")) { c->no_session = 1; continue; }
         if (!strcmp(arg, "--no-rc")) continue;
         if (!strcmp(arg, "--chatgpt")) { c->chatgpt = c->chatgpt_explicit = 1; continue; }
@@ -448,9 +450,10 @@ static Json *tool_schemas(const Config *c, int chat) {
     jadd(arr, tool(chat, "job_kill", "Stop a background job and the processes it started.", "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"required\":[\"id\"],\"additionalProperties\":false}"));
     return arr;
 }
-static Json *request(Provider *p, const Json *history, const char *instructions, const Config *tools) {
+static Json *request(Provider *p, const Json *history, const char *instructions, const Config *tools, int stream) {
     Json *j = jnew(J_OBJ), *arr = jnew(J_ARR), *v;
-    jset(j, "model", jstr(p->model)); jset(j, "stream", jbool(p->auth != NULL));
+    /* The ChatGPT backend only streams. */
+    jset(j, "model", jstr(p->model)); jset(j, "stream", jbool(p->auth != NULL || stream));
     if (p->speed && strcmp(p->speed, "auto")) {
         const char *tier = !strcmp(p->speed, "standard") ? "default" : !strcmp(p->speed, "fast") ? "priority" : p->speed;
         jset(j, "service_tier", jstr(tier));
@@ -471,16 +474,42 @@ static Json *request(Provider *p, const Json *history, const char *instructions,
     if (tools) jset(j, "tools", tool_schemas(tools, p->api == 1));
     return j;
 }
-static Json *send_request(Provider *p, Json *req, int *context_error) {
+/* Live display of a streamed reply: text deltas print as they arrive. Each delta
+ * is a whole JSON string (the parser rejects invalid UTF-8), so host_print sees
+ * complete characters. Reasoning is not shown, only "[thinking]" once. */
+typedef struct { int chat, text, thinking; char last; } Live;
+static void live_print(Live *l, const char *s) {
+    if (!*s) return;
+    host_print(s); l->text = 1; l->last = s[strlen(s) - 1];
+}
+static int live_event(const char *data, void *ctx) {
+    Live *l = ctx; Json *e = jparse(data), *text = NULL, *reasoning = NULL;
+    if (e && e->type == J_OBJ && l->chat) {
+        Json *choices = jget(e, "choices"), *delta = jget(choices && choices->type == J_ARR ? choices->child : NULL, "delta");
+        text = jget(delta, "content"); reasoning = jget(delta, "reasoning_content"); if (!reasoning) reasoning = jget(delta, "reasoning");
+    } else if (e && e->type == J_OBJ) {
+        if (jis(e, "type", "response.output_text.delta") || jis(e, "type", "response.refusal.delta")) text = jget(e, "delta");
+        else if (jis(e, "type", "response.reasoning_summary_text.delta") || jis(e, "type", "response.reasoning_text.delta")) reasoning = jget(e, "delta");
+    }
+    if (reasoning && reasoning->type == J_STR && *reasoning->s && !l->text && !l->thinking) { puts("[thinking]"); fflush(stdout); l->thinking = 1; }
+    if (text && text->type == J_STR) live_print(l, text->s);
+    jfree(e); return 1;
+}
+static void live_end(Live *l) {
+    if (l->text && l->last != '\n') puts("");
+    fflush(stdout);
+}
+static Json *send_request(Provider *p, Json *req, int *context_error, Live *live) {
     char *body = jdump(req), *url = endpoint(p); Http r; Json *j = NULL; int attempt;
     *context_error = 0;
     if (!provider_ready(p)) { free(body); free(url); return NULL; }
     for (attempt = 0; attempt < 2; attempt++) {
         if (p->auth && !auth_refresh(p->auth, 0)) break;
-        r = http_post(url, p->auth ? auth_key(p->auth) : p->key, p->auth ? auth_account(p->auth) : NULL, "application/json", body, p->timeout);
+        r = http_post_stream(url, p->auth ? auth_key(p->auth) : p->key, p->auth ? auth_account(p->auth) : NULL, "application/json", body, p->timeout, live ? live_event : NULL, live);
+        if (live) live_end(live); /* Before any error message. */
         if (r.status == 401 && p->auth && !attempt) { http_free(&r); if (auth_refresh(p->auth, 1)) continue; break; }
         authentication_error(p, &r);
-        if (http_ok(&r)) j = response_json(r.body);
+        if (http_ok(&r)) j = p->api == 1 ? chat_response_json(r.body) : response_json(r.body);
         else {
             Json *err = r.body ? jparse(r.body) : NULL;
             if (jis(jget(err, "error"), "code", "context_length_exceeded") || jis(jget(err, "error"), "code", "context_window_exceeded")) *context_error = 1;
@@ -495,7 +524,10 @@ static Json *send_request(Provider *p, Json *req, int *context_error) {
     }
     free(body); free(url); return j;
 }
-static Json *generate(Provider *p, const Json *h, const char *sys, const Config *tools, int *ctx) { Json *req = request(p, h, sys, tools), *r = send_request(p, req, ctx); jfree(req); return r; }
+/* LIVE, when given, streams the reply to the terminal; other requests stay quiet. */
+static Json *generate(Provider *p, const Json *h, const char *sys, const Config *tools, int *ctx, Live *live) {
+    Json *req = request(p, h, sys, tools, live != NULL), *r = send_request(p, req, ctx, live); jfree(req); return r;
+}
 static char *response_text(const Json *r, int chat) {
     Json *v, *part, *out; char *s = xstrdup(""); size_t n = 0;
     if (chat) { Json *choices = jget(r, "choices"); return free(s), xstrdup(jtext(jget(jget(choices ? choices->child : NULL, "message"), "content"))); }
@@ -570,7 +602,7 @@ static int compact(Config *c, Json **history, const char *latest, const char *sy
     fputs("[compacting conversation]\n", stderr);
     /* Same system prompt and tools, with the request appended: the cached prefix is reused. */
     ask = jcopy(*history); jadd(ask, message("user", compact_prompt));
-    r = generate(&c->main, ask, sys, c, &ctx); jfree(ask);
+    r = generate(&c->main, ask, sys, c, &ctx, NULL); jfree(ask);
     if (!r || !complete(r, c->main.api) || !text_only(r, c->main.api)) { jfree(r); return 0; }
     text = response_text(r, c->main.api); jfree(r);
     if (!*text) { free(text); return 0; }
@@ -603,13 +635,13 @@ static int review(Config *c, const char *cmd, const char *latest, const Json *hi
         jset(question, "type", jstr("choice")); jset(question, "name", jstr("shell_approval"));
         jset(question, "instructions", jstr(instructions));
         jset(question, "choices", jparse("[{\"value\":\"ALLOW\",\"description\":\"Command is authorized and safe to execute\"},{\"value\":\"DENY\",\"description\":\"Command must not execute\"}]")); jadd(questions, question); jset(q, "questions", questions);
-        r = send_request(&reviewer, q, &ctx); jfree(q);
+        r = send_request(&reviewer, q, &ctx, NULL); jfree(q);
         answers = jget(r, "answers"); a = answers && answers->type == J_ARR ? answers->child : NULL;
         ok = a && !a->next && jis(a, "name", "shell_approval") && jis(a, "type", "choice") && jis(a, "choice", "ALLOW");
         jfree(r);
     } else {
         char *start, *end;
-        h = jnew(J_ARR); jadd(h, message("user", s)); r = generate(&reviewer, h, instructions, NULL, &ctx); jfree(h);
+        h = jnew(J_ARR); jadd(h, message("user", s)); r = generate(&reviewer, h, instructions, NULL, &ctx, NULL); jfree(h);
         if (r && complete(r, reviewer.api) && text_only(r, reviewer.api)) {
             text = response_text(r, reviewer.api); start = text; while (*start == ' ' || *start == '\n' || *start == '\r' || *start == '\t') start++;
             end = start + strlen(start); while (end > start && (end[-1] == ' ' || end[-1] == '\n' || end[-1] == '\r' || end[-1] == '\t')) *--end = 0;
@@ -841,7 +873,7 @@ static Json *configuration(const Config *c) {
     a = jnew(J_ARR); for (i = 0; i < c->ninstruction; i++) jadd(a, jstr(c->instruction_files[i])); jset(j, "instruction_files", a);
     if (c->review_base_set) put_text(j, "review_base_url", c->review.base);
     if (c->review_api_set) put_text(j, "review_api", api_name(c->review.api));
-    jset(j, "no_line_edit", jbool(c->no_line_edit));
+    jset(j, "no_line_edit", jbool(c->no_line_edit)); jset(j, "stream", jbool(c->stream));
     jset(j, "http_timeout", jnum(c->main.timeout)); jset(j, "shell_timeout", jnum(c->shell_timeout));
     jset(j, "compact_bytes", jnum((unsigned long)c->compact_bytes)); jset(j, "output_bytes", jnum((unsigned long)c->output_bytes)); jset(j, "max_steps", jnum(c->steps));
     a = jnew(J_ARR); for (i = 0; i < c->nallow; i++) jadd(a, jstr(c->allow[i])); jset(j, "allow", a);
@@ -880,18 +912,20 @@ static void checkpoint(const Config *c, const Json *history, const char *latest)
 static int turn(Config *c, Json **h, const char *sys, const char *latest) {
     unsigned step; int retried_context = 0;
     for (step = 0; step < c->steps; step++) {
-        Json *r, *items, *v, *msg = NULL, *choice = NULL; char *text; int ctx, calls = 0, has_text, chat = c->main.api == 1;
+        Json *r, *items, *v, *msg = NULL, *choice = NULL; char *text; int ctx, calls = 0, has_text, chat = c->main.api == 1; Live live;
         if (host_interrupted()) return 0;
         sync_instructions(c, *h); /* Changes, e.g. the agent editing AGENTS.md, are appended. */
         checkpoint(c, *h, latest); /* The request so far, and each completed tool round. */
         if (c->compact_bytes) { char *s = jdump(*h); size_t n = strlen(s); free(s); if (n >= c->compact_bytes && !compact(c, h, latest, sys)) return 0; }
-        r = generate(&c->main, *h, sys, c, &ctx);
+        memset(&live, 0, sizeof live); live.chat = chat;
+        r = generate(&c->main, *h, sys, c, &ctx, c->stream ? &live : NULL);
         if (!r) { if (host_interrupted()) return 0; if (ctx && !retried_context && c->compact_bytes && compact(c, h, latest, sys)) { retried_context = 1; continue; } return 0; }
         if (!complete(r, chat)) { fputs("incomplete model response; no commands executed\n", stderr); jfree(r); return 0; }
         if (chat) { choice = jget(r, "choices")->child; msg = jget(choice, "message"); items = jget(msg, "tool_calls"); if (items && items->type == J_NULL) items = NULL; if (items && items->type != J_ARR) { jfree(r); return 0; } }
         else items = jget(r, "output");
         if (!validate_calls(items, *h, chat)) { fputs("invalid tool-call batch; no commands executed\n", stderr); jfree(r); return 0; }
-        text = response_text(r, chat); has_text = *text != 0; if (*text) { host_print(text); puts(""); } free(text);
+        /* A streamed reply is already on screen. */
+        text = response_text(r, chat); has_text = *text != 0; if (*text && !live.text) { host_print(text); puts(""); } free(text);
         if (chat) jadd(*h, jcopy(msg)); else for (v = items->child; v; v = v->next) jadd(*h, jcopy(v));
         for (v = items ? items->child : NULL; v; v = v->next) {
             Json *f, *result; char *output;

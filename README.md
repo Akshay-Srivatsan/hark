@@ -166,12 +166,19 @@ HTTP and HTTPS base URLs are accepted directly. Plain HTTP sends credentials and
 use it only on networks you trust.
 Configure proxies and CA certificates using your libcurl build's supported
 settings/environment. HTTP requests have a configurable timeout and a 32 MiB
-response cap. Requests are buffered, not displayed token by token; Responses SSE
-is accepted by collecting completed output items and requiring a successful
-final `response.completed` event. This includes Codex streams whose final event
-contains only metadata. A failed
-or incomplete response does not execute tools. Chat Completions uses nonstreaming
-responses. Requests offering the shell tool leave `parallel_tool_calls` at the
+response cap.
+
+Replies stream: the model's text appears as it arrives, and `[thinking]` is shown
+once while a reasoning model works (its reasoning is not printed). Tool calls are
+shown and run only after the whole reply has arrived and succeeded. A Responses
+stream must end with a successful `response.completed` event; completed output items
+are collected, including Codex streams whose final event has only metadata. A Chat
+Completions stream is rebuilt from its deltas, with tool calls reassembled from
+fragments, and must include a `finish_reason`. A failed, interrupted or incomplete
+reply never executes tools, though text already shown stays on screen. Use
+`--no-stream` (or `/set stream false`) for servers that stream badly; the ChatGPT
+backend always streams, but is then shown only when complete. Compaction and
+approval-review requests are never shown. Requests offering the shell tool leave `parallel_tool_calls` at the
 provider default; Hark validates a whole batch of calls, then runs them in order.
 There are no general automatic retries, so tool actions are not
 replayed following a transport error.
@@ -279,7 +286,7 @@ current configuration. No shell evaluates these values.
 | `system` | General guidance at the start of the system prompt (replaces the built-in guidance; `default` restores it) |
 | `system_files` | Files of additional trusted system instructions, appended in order (a missing file is an error) |
 | `instruction_files` | Project files such as `AGENTS.md`, given to the model when present (see below) |
-| `no_line_edit` | Boolean, default `false` |
+| `no_line_edit`, `stream` | Booleans: plain terminal input (default `false`), and showing replies as they arrive (default `true`) |
 
 `/model`, `/speed`, `/thinking`, `/approval` and `/review-model` are convenient
 commands for their respective settings. Use `/include`, `/import` and `/prompt`
@@ -659,7 +666,8 @@ formats, tool results, human-approval fail-closed behavior without a terminal,
 allow/deny precedence, reviewer errors, Decisions, compaction, malformed batches,
 SSE completion (including metadata-only Codex completion events), context-limit recovery, replay rejection, round limits, and a
 mocked device-login / OAuth refresh flow, model discovery without an initial model,
-runtime setting changes, unconditional approval, rc persistence, and background jobs
+runtime setting changes, unconditional approval, rc persistence, streamed replies (live
+text, reassembled tool calls, truncated streams), and background jobs
 (parallel runs, agent timeouts, kill, listing, argument checks, and cleanup at exit).
 Persistence tests cover all rc configuration keys, precedence, the read-only startup file,
 context/prompt imports, exports, safe transcript continuation, concurrent sessions,

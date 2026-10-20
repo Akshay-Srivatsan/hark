@@ -487,6 +487,140 @@ def test_jobs():
             time.sleep(.05)
 
 
+class StreamHandler(BaseHTTPRequestHandler):
+    """Replies with a scripted event stream; a callable entry pauses it."""
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+        self.server.requests.append(body)
+        try:
+            parts = self.server.script(body)
+        except Exception as exc:
+            self.server.errors.append(exc)
+            parts = []
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.end_headers()
+        for part in parts:
+            if callable(part):
+                part()
+            else:
+                self.wfile.write(part)
+                self.wfile.flush()
+
+
+def sse(event):
+    return b'data: ' + json.dumps(event).encode() + b'\n\n'
+
+
+def chat_chunk(delta=None, finish=None):
+    return sse({'object': 'chat.completion.chunk', 'choices': [{'index': 0, 'delta': delta or {}, 'finish_reason': finish}]})
+
+
+def responses_text(text):
+    item = {'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text}]}
+    return [sse({'type': 'response.output_item.done', 'output_index': 0, 'item': item}),
+            sse({'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [item]}})]
+
+
+def stream_server(script):
+    server = ThreadingHTTPServer(('127.0.0.1', 0), StreamHandler)
+    server.script, server.requests, server.errors = script, [], []
+    server.handle_error = lambda *_: None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def stream_args(server, chat, *extra):
+    return [BINARY, '--no-rc', '--no-session', '--approval', 'allow', '--base-url', f'http://127.0.0.1:{server.server_port}/v1',
+            '--model', 'main', *(['--api', 'chat'] if chat else []), *extra]
+
+
+def stream_env(tmp):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(('HARK_', 'XDG_')) and k != 'OPENAI_API_KEY'}
+    return dict(env, HOME=tmp, USERPROFILE=tmp)
+
+
+def test_streaming():
+    for chat in (False, True):
+        # Text appears while the reply is still arriving, after one "[thinking]" line.
+        release = threading.Event()
+        def live(body):
+            assert body['stream'] is True
+            if chat:
+                head = [chat_chunk({'role': 'assistant', 'reasoning_content': 'considering'}), chat_chunk({'content': 'Hello, '})]
+                tail = [chat_chunk({'content': 'world.'}), chat_chunk(finish='stop'), b'data: [DONE]\n\n']
+            else:
+                head = [sse({'type': 'response.reasoning_summary_text.delta', 'delta': 'considering'}),
+                        sse({'type': 'response.output_text.delta', 'delta': 'Hello, '})]
+                tail = [sse({'type': 'response.output_text.delta', 'delta': 'world.'})] + responses_text('Hello, world.')
+            return head + [lambda: release.wait(10)] + tail
+        server = stream_server(live)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                p = subprocess.Popen(stream_args(server, chat, '--', 'greet'), cwd=tmp, env=stream_env(tmp), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                seen = b''
+                deadline = time.monotonic() + 10
+                while b'Hello, ' not in seen:
+                    assert time.monotonic() < deadline, seen
+                    seen += os.read(p.stdout.fileno(), 4096)
+                assert b'world' not in seen and seen.index(b'[thinking]') < seen.index(b'Hello, '), seen
+                release.set()
+                out, err = p.communicate(timeout=10)
+                out = seen + out
+                assert p.returncode == 0, err
+                assert out.count(b'Hello, world.') == 1 and b'considering' not in out, out
+        finally:
+            release.set(); server.shutdown(); server.server_close()
+        # Streamed tool calls are reassembled; they run only once the reply is complete.
+        def tools(body):
+            history = body['messages' if chat else 'input']
+            if len(server.requests) == 2:
+                return [chat_chunk({'content': 'done'}), chat_chunk(finish='stop')] if chat else responses_text('done')
+            if not chat:
+                call = {'type': 'function_call', 'call_id': 'c1', 'name': 'sh', 'arguments': json.dumps({'command': 'printf ok > result'})}
+                return [sse({'type': 'response.function_call_arguments.delta', 'delta': '{"comm'}),
+                        sse({'type': 'response.output_item.done', 'output_index': 0, 'item': call}),
+                        sse({'type': 'response.completed', 'response': {'id': 'r', 'status': 'completed', 'output': [call]}})]
+            args = json.dumps({'command': 'printf ok > result'})
+            return [chat_chunk({'role': 'assistant', 'content': None, 'tool_calls': [{'index': 0, 'id': 'c1', 'type': 'function', 'function': {'name': 'sh', 'arguments': ''}}]})] + \
+                   [chat_chunk({'tool_calls': [{'index': 0, 'function': {'arguments': args[i:i + 5]}}]}) for i in range(0, len(args), 5)] + \
+                   [chat_chunk({'tool_calls': [{'index': 1, 'id': 'c2', 'function': {'name': 'sh', 'arguments': '{"command": "printf two > second"}'}}]}),
+                    chat_chunk(finish='tool_calls'), b'data: [DONE]\n\n']
+        server = stream_server(tools)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                p = subprocess.run(stream_args(server, chat, '--', 'use tools'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=20)
+                assert p.returncode == 0 and len(server.requests) == 2, (p.stdout, p.stderr)
+                assert pathlib.Path(tmp, 'result').read_text() == 'ok' and p.stdout.count('done') == 1
+                if chat:
+                    assert pathlib.Path(tmp, 'second').read_text() == 'two'
+                    sent = server.requests[1]['messages'][2]
+                    assert sent['tool_calls'][0]['function']['arguments'] == json.dumps({'command': 'printf ok > result'}), sent
+                    assert [c['id'] for c in sent['tool_calls']] == ['c1', 'c2'] and sent['tool_calls'][0]['function']['name'] == 'sh'
+        finally:
+            server.shutdown(); server.server_close()
+    # A chat stream that ends before finish_reason runs nothing; C1 controls in deltas are filtered.
+    def truncated(body):
+        return [chat_chunk({'content': 'X\u009b31m'}), chat_chunk({'tool_calls': [{'index': 0, 'id': 'c1', 'function': {'name': 'sh', 'arguments': '{"command": "printf bad > result"}'}}]})]
+    server = stream_server(truncated)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = subprocess.run(stream_args(server, True, '--', 'cut off'), cwd=tmp, env=stream_env(tmp), capture_output=True, timeout=20)
+            assert p.returncode == 1 and b'incomplete model response' in p.stderr and not pathlib.Path(tmp, 'result').exists(), p.stderr
+            assert b'X31m' in p.stdout and b'\xc2\x9b' not in p.stdout, p.stdout
+    finally:
+        server.shutdown(); server.server_close()
+    # --no-stream asks for a complete reply and prints it at the end.
+    def plain(path, body, headers):
+        assert body['stream'] is False
+        return 200, response('plain reply', chat=True), False
+    p, req, _ = run(plain, ['--api', 'chat', '--no-stream'])
+    assert p.returncode == 0 and 'plain reply' in p.stdout, p.stderr
+
+
 def test_device_auth():
     import base64
     import shlex
@@ -625,7 +759,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

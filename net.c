@@ -7,12 +7,46 @@
 #include <stdlib.h>
 #include <string.h>
 #define HTTP_LIMIT (32UL * 1024UL * 1024UL)
-typedef struct { char *s; size_t n; } Body;
+/* Incremental server-sent events: "data:" lines (CRLF or LF, possibly several per
+ * event) are joined and passed to FN at each blank line. Comments and other
+ * fields are ignored. One parser serves live display and final assembly. */
+typedef struct { char *line, *data; size_t lused, dused; int (*fn)(const char *data, void *ctx); void *ctx; int failed; } Sse;
+static void sse_dispatch(Sse *e) {
+    if (e->dused && !e->failed && !e->fn(e->data, e->ctx)) e->failed = 1;
+    e->dused = 0;
+}
+static void sse_line(Sse *e) {
+    size_t n = e->lused, skip = 5;
+    if (n && e->line[n - 1] == '\r') n--;
+    if (!n) sse_dispatch(e);
+    else if (n >= 5 && !strncmp(e->line, "data:", 5)) {
+        if (n > skip && e->line[skip] == ' ') skip++;
+        e->data = xrealloc(e->data, e->dused + n - skip + 2);
+        if (e->dused) e->data[e->dused++] = '\n';
+        memcpy(e->data + e->dused, e->line + skip, n - skip); e->dused += n - skip; e->data[e->dused] = 0;
+    }
+    e->lused = 0;
+}
+static void sse_feed(Sse *e, const char *s, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n') { sse_line(e); continue; }
+        if (!(e->lused & 1023)) e->line = xrealloc(e->line, e->lused + 1025);
+        e->line[e->lused++] = s[i];
+    }
+}
+static int sse_finish(Sse *e) {
+    if (e->lused) sse_line(e);
+    sse_dispatch(e); free(e->line); free(e->data); e->line = e->data = NULL; return !e->failed;
+}
+typedef struct { char *s; size_t n; Sse *live; } Body;
 static size_t receive(char *s, size_t size, size_t count, void *ctx) {
     Body *b = ctx; size_t n;
     if (size && count > (size_t)-1 / size) return 0;
     n = size * count; if (host_interrupted() || n > HTTP_LIMIT - b->n || memchr(s, 0, n)) return 0;
-    b->s = xrealloc(b->s, b->n + n + 1); memcpy(b->s + b->n, s, n); b->n += n; b->s[b->n] = 0; return n;
+    b->s = xrealloc(b->s, b->n + n + 1); memcpy(b->s + b->n, s, n); b->n += n; b->s[b->n] = 0;
+    if (b->live) sse_feed(b->live, s, n);
+    return n;
 }
 static struct curl_slist *header(struct curl_slist *h, const char *name, const char *value) {
     char *s; struct curl_slist *next;
@@ -32,8 +66,8 @@ static int has_scheme(const char *url, const char *scheme) {
     for (; *scheme; url++, scheme++) if (tolower((unsigned char)*url) != *scheme) return 0;
     return 1;
 }
-static Http http_request(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout) {
-    Http r = {NULL, 0}; Body b = {NULL, 0}; CURL *c = curl_easy_init(); CURLcode rc; struct curl_slist *h = NULL; char err[CURL_ERROR_SIZE] = {0};
+static Http http_request(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout, Sse *live) {
+    Http r = {NULL, 0}; Body b = {NULL, 0, NULL}; CURL *c = curl_easy_init(); CURLcode rc; struct curl_slist *h = NULL; char err[CURL_ERROR_SIZE] = {0};
     /* Older libcurl lacks CURLOPT_PROTOCOLS, so check the scheme here too. */
     if (!has_scheme(url, "http://") && !has_scheme(url, "https://")) { fputs("only HTTP and HTTPS URLs are supported\n", stderr); if (c) curl_easy_cleanup(c); return r; }
     if (!c) { fputs("cannot initialize HTTP\n", stderr); return r; }
@@ -50,7 +84,7 @@ static Http http_request(const char *url, const char *key, const char *account, 
         curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)strlen(body));
     } else curl_easy_setopt(c, CURLOPT_HTTPGET, 1L);
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, receive);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    b.live = live; curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
     curl_easy_setopt(c, CURLOPT_ERRORBUFFER, err);
     curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 #if LIBCURL_VERSION_NUM >= 0x072000
@@ -71,15 +105,20 @@ static Http http_request(const char *url, const char *key, const char *account, 
 #endif
     curl_easy_setopt(c, CURLOPT_USERAGENT, "hark/0.1");
     rc = curl_easy_perform(c);
+    if (live) (void)sse_finish(live); /* Display only; the body is assembled separately. */
     if (rc == CURLE_OK) { curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status); r.body = b.s ? b.s : xstrdup(""); }
     else { if (!host_interrupted()) fprintf(stderr, "HTTP transport failed: %s\n", err[0] ? err : curl_easy_strerror(rc)); free(b.s); }
     curl_slist_free_all(h); curl_easy_cleanup(c); return r;
 }
 Http http_post(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout) {
-    return http_request(url, key, account, type, body, timeout);
+    return http_request(url, key, account, type, body, timeout, NULL);
+}
+Http http_post_stream(const char *url, const char *key, const char *account, const char *type, const char *body, unsigned timeout, int (*on_event)(const char *data, void *ctx), void *ctx) {
+    Sse live; memset(&live, 0, sizeof live); live.fn = on_event; live.ctx = ctx;
+    return http_request(url, key, account, type, body, timeout, on_event ? &live : NULL);
 }
 Http http_get(const char *url, const char *key, const char *account, unsigned timeout) {
-    return http_request(url, key, account, NULL, NULL, timeout);
+    return http_request(url, key, account, NULL, NULL, timeout, NULL);
 }
 void http_free(Http *r) { free(r->body); r->body = NULL; }
 int http_ok(const Http *r) { return r->body && r->status >= 200 && r->status < 300; }
@@ -123,7 +162,9 @@ Json *http_json(const Http *r, const char *secret) {
 }
 /* A completed item can carry text, reasoning, or a function call. Codex's
  * final response often has metadata only, so never discard item.done events. */
-static int stream_event(const char *data, Json *items, Json **result, size_t *count) {
+typedef struct { Json *items, *result; size_t count; } ResponsesStream;
+static int stream_event(const char *data, void *ctx) {
+    ResponsesStream *rs = ctx; Json *items = rs->items, **result = &rs->result; size_t *count = &rs->count;
     Json *event, *index, *item; char *end; unsigned long n;
     if (!*data || !strcmp(data, "[DONE]")) return 1;
     event = jparse(data); if (!event || event->type != J_OBJ) { jfree(event); return 0; }
@@ -143,41 +184,84 @@ static int stream_event(const char *data, Json *items, Json **result, size_t *co
     jfree(event); return 1;
 }
 Json *response_json(const char *s) {
-    Json *result = jparse(s), *items, *out, *v; size_t count = 0, used = 0, i;
-    char *data;
+    Json *result = jparse(s), *out, *v; ResponsesStream rs; Sse e; size_t i;
     if (result) return result;
-    items = jnew(J_OBJ); data = xstrdup("");
-    /* Parse SSE frames, including CRLF and multi-line data fields. Ignore
-     * comments/other fields; never accept a stream without completion. */
-    while (*s) {
-        const char *end = strchr(s, '\n'); size_t n = end ? (size_t)(end - s) : strlen(s);
-        if (n && s[n - 1] == '\r') n--;
-        if (!n) {
-            if (!stream_event(data, items, &result, &count)) goto bad;
-            used = 0; data[0] = 0;
-        } else if (n >= 5 && !strncmp(s, "data:", 5)) {
-            size_t skip = 5; if (n > skip && s[skip] == ' ') skip++;
-            data = xrealloc(data, used + n - skip + 2);
-            if (used) data[used++] = '\n';
-            memcpy(data + used, s + skip, n - skip); used += n - skip; data[used] = 0;
-        }
-        if (!end) break;
-        s = end + 1;
-    }
-    if (used && !stream_event(data, items, &result, &count)) goto bad;
-    if (!result) goto bad;
-    if (count) {
+    /* Never accept a stream without a successful completion event. */
+    memset(&rs, 0, sizeof rs); rs.items = jnew(J_OBJ);
+    memset(&e, 0, sizeof e); e.fn = stream_event; e.ctx = &rs;
+    sse_feed(&e, s, strlen(s));
+    if (!sse_finish(&e) || !rs.result) goto bad;
+    result = rs.result; rs.result = NULL;
+    if (rs.count) {
         Json *final = jget(result, "output"), *f = final && final->type == J_ARR ? final->child : NULL;
         out = jnew(J_ARR);
-        for (i = 0; i < count || f; i++) {
-            char key[32]; snprintf(key, sizeof key, "%lu", (unsigned long)i); v = jget(items, key);
+        for (i = 0; i < rs.count || f; i++) {
+            char key[32]; snprintf(key, sizeof key, "%lu", (unsigned long)i); v = jget(rs.items, key);
             if (!v) v = f;
             if (!v) { jfree(out); goto bad; }
             jadd(out, jcopy(v)); if (f) f = f->next;
         }
         jset(result, "output", out);
     } else if (!jget(result, "output")) jset(result, "output", jnew(J_ARR));
-    free(data); jfree(items); return result;
+    jfree(rs.items); return result;
 bad:
-    free(data); jfree(items); jfree(result); return NULL;
+    jfree(rs.items); jfree(rs.result); jfree(result); return NULL; /* At most one is set. */
+}
+/* Chat Completions streams send choices[0].delta fragments: text, reasoning, and
+ * tool calls split by index (id and name first, arguments in pieces). They are
+ * rebuilt into the nonstreaming shape; without a finish_reason the response
+ * stays incomplete, so no tool runs. */
+#define CHAT_CALLS 64
+typedef struct { char *content, *reasoning, *finish; size_t ncontent, nreasoning; Json *calls[CHAT_CALLS]; size_t ncalls; } ChatStream;
+static void append(char **s, size_t *n, const char *part) {
+    size_t k = strlen(part); *s = xrealloc(*s, *n + k + 1); memcpy(*s + *n, part, k + 1); *n += k;
+}
+static void append_field(Json *obj, const char *key, const char *part) {
+    Json *v = jget(obj, key); size_t n = strlen(v->s); append(&v->s, &n, part);
+}
+static int chat_event(const char *data, void *ctx) {
+    ChatStream *c = ctx; Json *chunk, *choices, *choice, *delta, *v, *t;
+    if (!*data || !strcmp(data, "[DONE]")) return 1;
+    chunk = jparse(data);
+    if (!chunk || chunk->type != J_OBJ || (jget(chunk, "error") && jget(chunk, "error")->type != J_NULL)) { jfree(chunk); return 0; }
+    choices = jget(chunk, "choices"); choice = choices && choices->type == J_ARR ? choices->child : NULL;
+    delta = jget(choice, "delta");
+    if ((v = jget(delta, "content")) && v->type == J_STR) append(&c->content, &c->ncontent, v->s);
+    if (((v = jget(delta, "reasoning_content")) || (v = jget(delta, "reasoning"))) && v->type == J_STR) append(&c->reasoning, &c->nreasoning, v->s);
+    for (t = (v = jget(delta, "tool_calls")) && v->type == J_ARR ? v->child : NULL; t; t = t->next) {
+        Json *index = jget(t, "index"), *f = jget(t, "function"), *slot, *part; char *end; unsigned long k = c->ncalls ? c->ncalls - 1 : 0;
+        if (index && index->type == J_NUM) { k = strtoul(index->s, &end, 10); if (*end) { jfree(chunk); return 0; } }
+        if (k >= CHAT_CALLS || k > c->ncalls) { jfree(chunk); return 0; } /* Indexes arrive in order. */
+        if (k == c->ncalls) {
+            slot = jnew(J_OBJ); jset(slot, "id", jstr("")); jset(slot, "type", jstr("function"));
+            part = jnew(J_OBJ); jset(part, "name", jstr("")); jset(part, "arguments", jstr("")); jset(slot, "function", part);
+            c->calls[c->ncalls++] = slot;
+        }
+        slot = c->calls[k]; part = jget(slot, "function");
+        if ((v = jget(t, "id")) && v->type == J_STR && !*jget(slot, "id")->s) append_field(slot, "id", v->s);
+        /* Some servers repeat the whole name in every fragment. */
+        if ((v = jget(f, "name")) && v->type == J_STR && strcmp(jget(part, "name")->s, v->s)) append_field(part, "name", v->s);
+        if ((v = jget(f, "arguments")) && v->type == J_STR) append_field(part, "arguments", v->s);
+    }
+    if ((v = jget(choice, "finish_reason")) && v->type == J_STR) { free(c->finish); c->finish = xstrdup(v->s); }
+    jfree(chunk); return 1;
+}
+Json *chat_response_json(const char *s) {
+    Json *result = jparse(s), *choices, *choice, *msg, *calls; ChatStream c; Sse e; size_t i;
+    if (result) return result;
+    memset(&c, 0, sizeof c); memset(&e, 0, sizeof e); e.fn = chat_event; e.ctx = &c;
+    sse_feed(&e, s, strlen(s));
+    if (!sse_finish(&e) || (!c.ncontent && !c.ncalls && !c.finish)) {
+        for (i = 0; i < c.ncalls; i++) jfree(c.calls[i]);
+        free(c.content); free(c.reasoning); free(c.finish); return NULL;
+    }
+    msg = jnew(J_OBJ); jset(msg, "role", jstr("assistant"));
+    jset(msg, "content", c.ncontent || !c.ncalls ? jstr(c.content ? c.content : "") : jnew(J_NULL));
+    if (c.nreasoning) jset(msg, "reasoning_content", jstr(c.reasoning));
+    if (c.ncalls) { calls = jnew(J_ARR); for (i = 0; i < c.ncalls; i++) jadd(calls, c.calls[i]); jset(msg, "tool_calls", calls); }
+    choice = jnew(J_OBJ); jset(choice, "index", jnum(0)); jset(choice, "message", msg);
+    jset(choice, "finish_reason", c.finish ? jstr(c.finish) : jnew(J_NULL));
+    choices = jnew(J_ARR); jadd(choices, choice);
+    result = jnew(J_OBJ); jset(result, "choices", choices);
+    free(c.content); free(c.reasoning); free(c.finish); return result;
 }

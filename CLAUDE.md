@@ -89,5 +89,6 @@ These are deliberate design constraints.
 ### Provider quirks
 
 - **Wire APIs:** Responses (default) or Chat Completions (`--api chat`). Some OpenAI-compatible servers only have `/chat/completions`.
+- **Streaming:** main agent requests stream (`stream` setting) through `http_post_stream()`. A shared incremental SSE parser in `net.c` feeds the live printer (`Live` in `hark.c`) and final assembly (`response_json()`, `chat_response_json()`). Tools run only from the assembled, complete response. Compaction and reviewer requests pass no `Live` and stay silent. `tests/integration.py` has `StreamHandler` for scripted, pausable streams.
 - **Fields hark omits:** do not send `parallel_tool_calls`, because some servers reject `false`.
 - **Error messages:** `http_report()` shows only the provider's error message, escaped, truncated, and with the credential redacted. Never print raw response bodies.
