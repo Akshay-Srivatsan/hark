@@ -487,6 +487,7 @@ static unsigned long context_window(Config *c) {
     for (v = jget(j, c->main.auth ? "models" : "data"), v = v && v->type == J_ARR ? v->child : NULL; v && !cached; v = v->next) {
         if (strcmp(jtext(jget(v, c->main.auth ? "slug" : "id")), c->main.model)) continue;
         for (i = 0; fields[i] && !cached; i++) cached = usage_number(jget(v, fields[i]));
+        if (!cached) cached = usage_number(jget(jget(v, "meta"), "n_ctx")); /* llama.cpp, for a loaded model */
     }
     jfree(j); return cached;
 }
@@ -611,7 +612,10 @@ static Json *send_request(Provider *p, Json *req, int *context_error, Live *live
         }
         if ((!j || j->type != J_OBJ || (jget(j, "error") && jget(j, "error")->type != J_NULL)) && host_interrupted()) { jfree(j); j = NULL; }
         else if (!j || j->type != J_OBJ || (jget(j, "error") && jget(j, "error")->type != J_NULL)) {
-            http_report("model request failed", &r, *context_error ? "context too large" : http_ok(&r) ? "invalid response" : NULL, p->auth ? auth_key(p->auth) : p->key);
+            const char *detail = NULL, *problem = http_ok(&r) ? response_problem(&detail) : NULL;
+            /* Say what was wrong with a 200 reply, e.g. a stream that never completed. */
+            http_report_detail("model request failed", &r, *context_error ? "context too large" : problem ? problem : http_ok(&r) ? "invalid response" : NULL,
+                               detail, p->auth ? auth_key(p->auth) : p->key);
             jfree(j); j = NULL;
         }
         http_free(&r); break;

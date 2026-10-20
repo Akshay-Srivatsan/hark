@@ -169,7 +169,8 @@ When the provider reports token usage and the context window is known, the promp
 shows how full the context is, as in `12% > `. The figure is the latest request's
 tokens (input plus output) out of the model's window. The window comes from the
 `context_window` setting (`--context-window N`), or else from the provider's model
-list (fields such as `context_window`, `context_length` or `max_model_len`), looked up
+list (fields such as `context_window`, `context_length` or `max_model_len`, or
+llama.cpp's `meta.n_ctx` for a loaded model), looked up
 once per provider and model. `/status` shows the token counts. Compaction and
 `/reset` clear the figure until the next reply. Chat streams request usage with
 `stream_options`.
@@ -211,7 +212,11 @@ stream must end with a successful `response.completed` event; completed output i
 are collected, including Codex streams whose final event has only metadata. A Chat
 Completions stream is rebuilt from its deltas, with tool calls reassembled from
 fragments, and must include a `finish_reason`. A failed, interrupted or incomplete
-reply never executes tools, though text already shown stays on screen. Use
+reply never executes tools, though text already shown stays on screen. The error
+says what was wrong, such as `model request failed (HTTP 200, the stream ended
+without response.completed)`, followed by any message the provider sent (escaped,
+truncated, credential redacted). llama.cpp's Responses streams, which omit
+`output_index`, are accepted. Use
 `--no-stream` (or `/set stream false`) for servers that stream badly; the ChatGPT
 backend always streams, but is then shown only when complete. Compaction and
 approval-review requests are never shown. Requests offering the shell tool leave `parallel_tool_calls` at the

@@ -651,6 +651,13 @@ def test_context_usage():
     assert p.returncode == 0, p.stderr
     assert p.stdout.count('context: no usage reported yet') == 2 and p.stdout.count('context: 250 of 1000 tokens (25%)') == 2, p.stdout
     assert [r[0] for r in req].count('/v1/models') == 1
+    # llama.cpp reports the window only as meta.n_ctx, for a loaded model.
+    def llama(path, body, headers):
+        if path.endswith('/models'):
+            return 200, {'object': 'list', 'data': [{'id': 'main', 'meta': {'n_ctx': 2000, 'n_ctx_train': 9000}}]}, False
+        return handle(path, body, headers)
+    p, _, _ = run(llama, prompt=None, stdin='hello\n/status\n')
+    assert 'context: 250 of 2000 tokens (12%)' in p.stdout, p.stdout
     # A context_window setting overrides the lookup; without either, /status says so.
     p, req, _ = run(handle, ['--context-window', '500'], prompt=None, stdin='hello\n/status\n')
     assert 'context: 250 of 500 tokens (50%)' in p.stdout and '/v1/models' not in [r[0] for r in req], p.stdout
@@ -737,6 +744,29 @@ def test_presentation():
         return 200, r, False
     p, _, _ = run(thought, ['--api', 'chat', '--no-stream', '--show-thinking'])
     assert p.stdout.startswith('because\n\nanswer\n'), repr(p.stdout)
+
+
+def test_stream_errors():
+    key = 'sk-stream-secret-key'
+    cases = [
+        (False, [sse({'type': 'response.output_text.delta', 'delta': 'partial'})], 'the stream ended without response.completed'),
+        (False, [sse({'type': 'error', 'message': 'overloaded \x1b[31mnow ' + key})], 'the stream reported an error): overloaded \\x1b[31mnow [redacted]'),
+        (False, [sse({'type': 'response.failed', 'response': {'error': {'message': 'quota exceeded'}}})], 'the provider reported that the response failed): quota exceeded'),
+        (False, [sse({'type': 'response.incomplete', 'response': {'incomplete_details': {'reason': 'max_output_tokens'}}})], 'the response was incomplete): max_output_tokens'),
+        (False, [b': only comments\n\n'], 'the reply was neither JSON nor an event stream'),
+        (True, [chat_chunk({'content': 'partial'}), sse({'error': {'message': 'model crashed'}})], 'the stream reported an error): model crashed'),
+        (True, [chat_chunk({'tool_calls': [{'index': 3, 'id': 'c', 'function': {'name': 'sh', 'arguments': '{}'}}]})], 'a streamed tool call had an invalid index'),
+    ]
+    for chat, events, message in cases:
+        server = stream_server(lambda body, events=events: events)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                env = dict(stream_env(tmp), TEST_KEY=key)
+                p = subprocess.run(stream_args(server, chat, '--key-env', 'TEST_KEY', '--', 'go'), cwd=tmp, env=env, capture_output=True, text=True, timeout=20)
+                assert p.returncode == 1 and 'model request failed (HTTP 200, ' + message in p.stderr, (message, p.stderr)
+                assert key not in p.stderr and '\x1b' not in p.stderr
+        finally:
+            server.shutdown(); server.server_close()
 
 
 def test_device_auth():
@@ -877,7 +907,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_stream_errors, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

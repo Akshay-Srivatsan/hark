@@ -123,34 +123,41 @@ Http http_get(const char *url, const char *key, const char *account, unsigned ti
 void http_free(Http *r) { free(r->body); r->body = NULL; }
 int http_ok(const Http *r) { return r->body && r->status >= 200 && r->status < 300; }
 #define ERROR_LIMIT 400
+/* A provider's message, truncated and with the credential redacted (servers
+ * sometimes echo it back). It is still printed escaped. */
+static char *clean_message(const char *m, const char *secret) {
+    char *s = xstrdup(m), *hit; size_t n;
+    if (secret && strlen(secret) >= 8) while ((hit = strstr(s, secret)) != NULL) {
+        char *next = xmalloc(strlen(s) - strlen(secret) + 11);
+        memcpy(next, s, (size_t)(hit - s)); strcpy(next + (hit - s), "[redacted]"); strcat(next, hit + strlen(secret));
+        free(s); s = next;
+    }
+    if ((n = strlen(s)) > ERROR_LIMIT) {
+        n = ERROR_LIMIT; while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--; /* Keep whole UTF-8 characters. */
+        strcpy(s + n, "...");
+    }
+    return s;
+}
 /* Only the provider's error message is shown, never the rest of the body. */
 static char *error_message(const Http *r, const char *secret) {
-    Json *j = r->body ? jparse(r->body) : NULL, *e = jget(j, "error"), *m = NULL; char *s = NULL, *hit; size_t n;
+    Json *j = r->body ? jparse(r->body) : NULL, *e = jget(j, "error"), *m = NULL; char *s = NULL;
     if (e && e->type == J_OBJ) m = jget(e, "message");
     else if (e && e->type == J_STR) m = e;
     if (!m || m->type != J_STR) m = jget(j, "message");
     if (!m || m->type != J_STR) m = jget(j, "detail");
-    if (m && m->type == J_STR && *m->s) {
-        s = xstrdup(m->s);
-        /* Servers sometimes echo the credential back; never print it. */
-        if (secret && strlen(secret) >= 8) while ((hit = strstr(s, secret)) != NULL) {
-            char *next = xmalloc(strlen(s) - strlen(secret) + 11);
-            memcpy(next, s, (size_t)(hit - s)); strcpy(next + (hit - s), "[redacted]"); strcat(next, hit + strlen(secret));
-            free(s); s = next;
-        }
-        if ((n = strlen(s)) > ERROR_LIMIT) {
-            n = ERROR_LIMIT; while (n && ((unsigned char)s[n] & 0xc0) == 0x80) n--; /* Keep whole UTF-8 characters. */
-            strcpy(s + n, "...");
-        }
-    }
+    if (m && m->type == J_STR && *m->s) s = clean_message(m->s, secret);
     jfree(j); return s;
 }
-void http_report(const char *what, const Http *r, const char *note, const char *secret) {
+void http_report_detail(const char *what, const Http *r, const char *note, const char *detail, const char *secret) {
     char *message;
     if (host_interrupted()) return;
     fprintf(stderr, "%s (HTTP %ld%s%s)", what, r->status, note ? ", " : "", note ? note : "");
-    if ((message = error_message(r, secret)) != NULL) { fputs(": ", stderr); host_eprint(message); free(message); }
+    message = detail && *detail ? clean_message(detail, secret) : error_message(r, secret);
+    if (message) { fputs(": ", stderr); host_eprint(message); free(message); }
     fputc('\n', stderr);
+}
+void http_report(const char *what, const Http *r, const char *note, const char *secret) {
+    http_report_detail(what, r, note, NULL, secret);
 }
 Json *http_json(const Http *r, const char *secret) {
     Json *j = r->body ? jparse(r->body) : NULL;
@@ -162,27 +169,48 @@ Json *http_json(const Http *r, const char *secret) {
 }
 /* A completed item can carry text, reasoning, or a function call. Codex's
  * final response often has metadata only, so never discard item.done events. */
-typedef struct { Json *items, *result; size_t count, done; } ResponsesStream;
+/* Why the last reply could not be assembled: a fixed phrase, plus any message the
+ * provider sent (untrusted; see http_report_detail). The first problem wins. */
+static const char *problem; static char *problem_detail;
+static void set_problem(const char *why, const Json *detail) {
+    if (problem) return;
+    problem = why; free(problem_detail);
+    problem_detail = detail && detail->type == J_STR && *detail->s ? xstrdup(detail->s) : NULL;
+}
+static void clear_problem(void) { problem = NULL; free(problem_detail); problem_detail = NULL; }
+const char *response_problem(const char **detail) { *detail = problem_detail; return problem; }
+static const Json *event_message(const Json *e) {
+    const Json *m = jget(e, "message");
+    if (!m || m->type != J_STR) m = jget(jget(e, "error"), "message");
+    if (!m || m->type != J_STR) m = jget(jget(jget(e, "response"), "error"), "message");
+    return m && m->type == J_STR ? m : NULL;
+}
+typedef struct { Json *items, *result; size_t count, done, events; } ResponsesStream;
 static int stream_event(const char *data, void *ctx) {
     ResponsesStream *rs = ctx; Json *items = rs->items, **result = &rs->result; size_t *count = &rs->count;
     Json *event, *index, *item; char *end; unsigned long n;
     if (!*data || !strcmp(data, "[DONE]")) return 1;
-    event = jparse(data); if (!event || event->type != J_OBJ) { jfree(event); return 0; }
-    if (jis(event, "type", "error") || jis(event, "type", "response.failed") || jis(event, "type", "response.incomplete")) { jfree(event); return 0; }
+    rs->events++;
+    event = jparse(data); if (!event || event->type != J_OBJ) { set_problem("a stream event was not valid JSON", NULL); jfree(event); return 0; }
+    if (jis(event, "type", "error")) { set_problem("the stream reported an error", event_message(event)); jfree(event); return 0; }
+    if (jis(event, "type", "response.failed")) { set_problem("the provider reported that the response failed", event_message(event)); jfree(event); return 0; }
+    if (jis(event, "type", "response.incomplete")) {
+        set_problem("the response was incomplete", jget(jget(jget(event, "response"), "incomplete_details"), "reason")); jfree(event); return 0;
+    }
     if (jis(event, "type", "response.output_item.done")) {
         char key[32];
         index = jget(event, "output_index"); item = jget(event, "item");
-        if (!item || item->type != J_OBJ) { jfree(event); return 0; }
+        if (!item || item->type != J_OBJ) { set_problem("a stream output item was malformed", NULL); jfree(event); return 0; }
         /* llama.cpp omits output_index; its items arrive in output order. */
         if (!index) n = (unsigned long)rs->done;
-        else if (index->type != J_NUM || index->s[0] < '0' || index->s[0] > '9') { jfree(event); return 0; }
-        else { n = strtoul(index->s, &end, 10); if (*end) { jfree(event); return 0; } }
-        if (n >= 1024) { jfree(event); return 0; }
+        else if (index->type != J_NUM || index->s[0] < '0' || index->s[0] > '9' || (n = strtoul(index->s, &end, 10), *end) || n >= 1024) {
+            set_problem("a stream output item had an invalid output_index", NULL); jfree(event); return 0;
+        }
         snprintf(key, sizeof key, "%lu", n); rs->done++;
         jset(items, key, jcopy(item)); if (n + 1 > *count) *count = (size_t)n + 1;
     } else if (jis(event, "type", "response.completed")) {
         Json *response = jget(event, "response");
-        if (!response || response->type != J_OBJ || *result) { jfree(event); return 0; }
+        if (!response || response->type != J_OBJ || *result) { set_problem(*result ? "the stream completed twice" : "the completion event was malformed", NULL); jfree(event); return 0; }
         *result = jcopy(response);
         if (!jget(*result, "status")) jset(*result, "status", jstr("completed"));
     }
@@ -190,12 +218,15 @@ static int stream_event(const char *data, void *ctx) {
 }
 Json *response_json(const char *s) {
     Json *result = jparse(s), *out, *v; ResponsesStream rs; Sse e; size_t i;
+    clear_problem();
     if (result) return result;
     /* Never accept a stream without a successful completion event. */
     memset(&rs, 0, sizeof rs); rs.items = jnew(J_OBJ);
     memset(&e, 0, sizeof e); e.fn = stream_event; e.ctx = &rs;
     sse_feed(&e, s, strlen(s));
-    if (!sse_finish(&e) || !rs.result) goto bad;
+    if (!sse_finish(&e)) goto bad;
+    if (!rs.events) { set_problem("the reply was neither JSON nor an event stream", NULL); goto bad; }
+    if (!rs.result) { set_problem("the stream ended without response.completed", NULL); goto bad; }
     result = rs.result; rs.result = NULL;
     if (rs.count) {
         Json *final = jget(result, "output"), *f = final && final->type == J_ARR ? final->child : NULL;
@@ -203,7 +234,7 @@ Json *response_json(const char *s) {
         for (i = 0; i < rs.count || f; i++) {
             char key[32]; snprintf(key, sizeof key, "%lu", (unsigned long)i); v = jget(rs.items, key);
             if (!v) v = f;
-            if (!v) { jfree(out); goto bad; }
+            if (!v) { set_problem("the stream was missing output items", NULL); jfree(out); goto bad; }
             jadd(out, jcopy(v)); if (f) f = f->next;
         }
         jset(result, "output", out);
@@ -217,7 +248,7 @@ bad:
  * rebuilt into the nonstreaming shape; without a finish_reason the response
  * stays incomplete, so no tool runs. */
 #define CHAT_CALLS 64
-typedef struct { char *content, *reasoning, *finish; size_t ncontent, nreasoning; Json *calls[CHAT_CALLS], *usage; size_t ncalls; } ChatStream;
+typedef struct { char *content, *reasoning, *finish; size_t ncontent, nreasoning; Json *calls[CHAT_CALLS], *usage; size_t ncalls, events; } ChatStream;
 static void append(char **s, size_t *n, const char *part) {
     size_t k = strlen(part); *s = xrealloc(*s, *n + k + 1); memcpy(*s + *n, part, k + 1); *n += k;
 }
@@ -227,8 +258,12 @@ static void append_field(Json *obj, const char *key, const char *part) {
 static int chat_event(const char *data, void *ctx) {
     ChatStream *c = ctx; Json *chunk, *choices, *choice, *delta, *v, *t;
     if (!*data || !strcmp(data, "[DONE]")) return 1;
-    chunk = jparse(data);
-    if (!chunk || chunk->type != J_OBJ || (jget(chunk, "error") && jget(chunk, "error")->type != J_NULL)) { jfree(chunk); return 0; }
+    c->events++; chunk = jparse(data);
+    if (!chunk || chunk->type != J_OBJ) { set_problem("a stream event was not valid JSON", NULL); jfree(chunk); return 0; }
+    if (jget(chunk, "error") && jget(chunk, "error")->type != J_NULL) {
+        const Json *m = event_message(chunk); if (!m && jget(chunk, "error")->type == J_STR) m = jget(chunk, "error");
+        set_problem("the stream reported an error", m); jfree(chunk); return 0;
+    }
     /* Usage usually arrives in a final chunk with no choices. */
     if ((v = jget(chunk, "usage")) && v->type == J_OBJ) { jfree(c->usage); c->usage = jcopy(v); }
     choices = jget(chunk, "choices"); choice = choices && choices->type == J_ARR ? choices->child : NULL;
@@ -237,8 +272,8 @@ static int chat_event(const char *data, void *ctx) {
     if (((v = jget(delta, "reasoning_content")) || (v = jget(delta, "reasoning"))) && v->type == J_STR) append(&c->reasoning, &c->nreasoning, v->s);
     for (t = (v = jget(delta, "tool_calls")) && v->type == J_ARR ? v->child : NULL; t; t = t->next) {
         Json *index = jget(t, "index"), *f = jget(t, "function"), *slot, *part; char *end; unsigned long k = c->ncalls ? c->ncalls - 1 : 0;
-        if (index && index->type == J_NUM) { k = strtoul(index->s, &end, 10); if (*end) { jfree(chunk); return 0; } }
-        if (k >= CHAT_CALLS || k > c->ncalls) { jfree(chunk); return 0; } /* Indexes arrive in order. */
+        if (index && index->type == J_NUM) { k = strtoul(index->s, &end, 10); if (*end) k = CHAT_CALLS; }
+        if (k >= CHAT_CALLS || k > c->ncalls) { set_problem("a streamed tool call had an invalid index", NULL); jfree(chunk); return 0; } /* Indexes arrive in order. */
         if (k == c->ncalls) {
             slot = jnew(J_OBJ); jset(slot, "id", jstr("")); jset(slot, "type", jstr("function"));
             part = jnew(J_OBJ); jset(part, "name", jstr("")); jset(part, "arguments", jstr("")); jset(slot, "function", part);
@@ -254,11 +289,15 @@ static int chat_event(const char *data, void *ctx) {
     jfree(chunk); return 1;
 }
 Json *chat_response_json(const char *s) {
-    Json *result = jparse(s), *choices, *choice, *msg, *calls; ChatStream c; Sse e; size_t i;
+    Json *result = jparse(s), *choices, *choice, *msg, *calls; ChatStream c; Sse e; size_t i; int ok;
+    clear_problem();
     if (result) return result;
     memset(&c, 0, sizeof c); memset(&e, 0, sizeof e); e.fn = chat_event; e.ctx = &c;
     sse_feed(&e, s, strlen(s));
-    if (!sse_finish(&e) || (!c.ncontent && !c.ncalls && !c.finish)) {
+    ok = sse_finish(&e);
+    if (ok && !c.events) { set_problem("the reply was neither JSON nor an event stream", NULL); ok = 0; }
+    else if (ok && !c.ncontent && !c.ncalls && !c.finish) { set_problem("the stream ended without a reply", NULL); ok = 0; }
+    if (!ok) {
         for (i = 0; i < c.ncalls; i++) jfree(c.calls[i]);
         jfree(c.usage); free(c.content); free(c.reasoning); free(c.finish); return NULL;
     }

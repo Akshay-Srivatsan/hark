@@ -17,8 +17,13 @@ Json *http_json(const Http *r, const char *secret);
 /* Print "WHAT (HTTP n[, NOTE])" and the provider's error message, if any: escaped,
  * truncated, and with SECRET (the request's credential, if any) redacted. */
 void http_report(const char *what, const Http *r, const char *note, const char *secret);
+/* The same, but showing DETAIL (a provider message from elsewhere) instead. */
+void http_report_detail(const char *what, const Http *r, const char *note, const char *detail, const char *secret);
 /* Accept a JSON response, or the final response.completed SSE event. */
 Json *response_json(const char *body);
 /* Accept a Chat Completions JSON response, or rebuild one from its stream. */
 Json *chat_response_json(const char *body);
+/* Why the last response_json/chat_response_json call failed, if known: a short
+ * phrase, and in *DETAIL any message the provider sent (untrusted). */
+const char *response_problem(const char **detail);
 #endif
