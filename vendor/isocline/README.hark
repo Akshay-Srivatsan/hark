@@ -1,0 +1,7 @@
+Isocline v1.1.0, unmodified include/, src/, and LICENSE from upstream.
+Tag commit: b4f1796627e75fc765cc26ec8091c683ef4d7417
+Source: https://github.com/daanx/isocline/tree/v1.1.0
+License: MIT (see LICENSE in this directory).
+
+Compiled as its single translation unit src/isocline.c. No external libraries
+are required. Used only for interactive prompt editing, with in-memory history.

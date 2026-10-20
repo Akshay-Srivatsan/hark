@@ -1,0 +1,19 @@
+# Build outputs
+*.o
+/hark
+/hark.exe
+/tests/unit
+/tests/unit.exe
+__pycache__/
+
+# Local Hark files. Sessions and logins live in per-user XDG directories, but
+# pre-XDG credentials and project startup files may sit in a checkout.
+.hark-auth.json
+.hark-auth.json.*
+.harkrc
+.harkrc.*
+# Sidecar locks from /save and /export.
+*.lock
+
+# macOS Finder metadata.
+.DS_Store

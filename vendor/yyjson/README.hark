@@ -1,0 +1,8 @@
+yyjson 0.12.0, unmodified upstream src/yyjson.c, src/yyjson.h and LICENSE.
+Source: https://github.com/ibireme/yyjson/tree/0.12.0
+License: MIT (see LICENSE in this directory).
+
+The harness uses strict JSON, retains raw numeric literals, and rejects duplicate
+keys, embedded NUL strings, and nesting deeper than 128 in its owning-tree adapter.
+No compiler-specific feature is required by hark. yyjson detects the target and
+provides portable fallbacks internally. No build-time download is performed.
