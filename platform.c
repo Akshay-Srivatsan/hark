@@ -168,6 +168,23 @@ void host_interrupt_disarm(void) { if (interrupt_armed) (void)sigaction(SIGINT, 
 #endif
 int host_interrupted(void) { return interrupt_flag != 0; }
 void host_interrupt_clear(void) { interrupt_flag = 0; }
+int host_stdout_tty(void) {
+#ifdef _WIN32
+    return _isatty(_fileno(stdout));
+#else
+    return isatty(STDOUT_FILENO);
+#endif
+}
+void host_enable_ansi(void) {
+#ifdef _WIN32
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+    /* Windows 10+ consoles interpret ANSI sequences only when asked. */
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE); DWORD mode;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) (void)SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#endif
+}
 void host_sleep(unsigned s) {
 #ifdef _WIN32
     unsigned long ms = s * 1000UL;

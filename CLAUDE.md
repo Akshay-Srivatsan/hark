@@ -60,6 +60,7 @@ x86_64-w64-mingw32-gcc -std=c99 -Wall -Wextra -pedantic -c platform.c -o /dev/nu
   - A foreground `sh` uses the smaller of the agent's `timeout` and `--shell-timeout`. Background jobs use the agent's timeout (default 3600 s).
 - **Job supervisors:** on POSIX each background job is a forked supervisor process running `host_run`, so output is drained and timeouts are enforced while Hark sits at the prompt. It reports `status timed truncated\n` plus the output over a pipe, and stops if Hark exits. On Windows, jobs run on threads with job objects.
 - **Display:** the terminal shows only `$ command` and an outcome line. Output goes to the model, never the terminal. Print any provider or tool text with `host_print`/`host_eprint`.
+- **Presentation (`render.c`):** `color` and `markdown` are tri-state (`render_mode()`), resolved against stdout by `render_setup()`, which `main()` and `set_option()` call. Only `render_style()` and the renderer emit escapes. Model text goes through `render_text()`/`render_thinking()` and ends with `render_end()`. Markdown renders a line at a time and buffers table rows until the table ends.
 
 ### Prompt construction and caching
 

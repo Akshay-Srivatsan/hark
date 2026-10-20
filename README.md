@@ -23,7 +23,7 @@ make
 Or compile directly, without make or pkg-config:
 
 ```sh
-cc -std=c99 -O2 -o hark hark.c json.c net.c auth.c platform.c line.c store.c session.c vendor/yyjson/yyjson.c vendor/isocline/src/isocline.c -lcurl
+cc -std=c99 -O2 -o hark hark.c json.c net.c auth.c platform.c line.c store.c session.c render.c vendor/yyjson/yyjson.c vendor/isocline/src/isocline.c -lcurl
 ```
 
 The Makefile uses POSIX make syntax and standard POSIX utilities only:
@@ -66,7 +66,7 @@ On native Windows use a C99-capable compiler such as MinGW-w64 and a Windows
 libcurl build:
 
 ```sh
-x86_64-w64-mingw32-gcc -std=c99 -O2 -o hark.exe hark.c json.c net.c auth.c platform.c line.c store.c session.c vendor/yyjson/yyjson.c vendor/isocline/src/isocline.c -lcurl -ladvapi32
+x86_64-w64-mingw32-gcc -std=c99 -O2 -o hark.exe hark.c json.c net.c auth.c platform.c line.c store.c session.c render.c vendor/yyjson/yyjson.c vendor/isocline/src/isocline.c -lcurl -ladvapi32
 ```
 
 Or, with a POSIX make installed, `make CC=... LDLIBS='-lcurl -ladvapi32'`.
@@ -137,6 +137,33 @@ interrupted (unfinished ones as not run), so you can continue or redirect the ta
 Commands from `.harkrc` or `--include` files still pending are skipped. With
 `--no-line-edit`, Ctrl-C at the prompt discards the partial line and Ctrl-D on an
 empty line exits. In a one-shot or piped run, Ctrl-C stops Hark with exit status 130.
+
+### Color, Markdown and thinking
+
+Three independent settings control presentation:
+
+| Setting | Values | Effect |
+| --- | --- | --- |
+| `color` (`--color[=WHEN]`) | `always`/`yes`/`force`, `never`/`no`/`none`, `auto`/`tty`/`if-tty`; default `never` | ANSI colors for commands, outcomes (green, red, yellow), jobs, notes and thinking |
+| `markdown` (`--markdown[=WHEN]`) | the same; default `never` | Lay out replies as Markdown |
+| `show_thinking` (`--show-thinking`) | boolean; default `false` | Show the model's reasoning, when the provider returns it |
+
+As with `ls`, `--color` alone means `always`, and `--color=WHEN` chooses. `auto` is on
+when standard output is a terminal; for color it also respects `NO_COLOR` and
+`TERM=dumb`. The same values work with `/set color auto` and `/set markdown yes`.
+
+Markdown keeps the markup visible and adds layout: tables are aligned (their
+`:`-alignment honored), and with color, headings, inline code, code blocks, bold,
+italic, links, quotes and list markers are styled. Without color, Markdown only
+adjusts spacing: aligned tables, indented code blocks, a blank line before headings.
+Streamed replies are rendered a line at a time, and a table appears when its last
+row arrives. Model text is still sanitized: escape sequences in replies are shown
+escaped, so only Hark's own styling reaches the terminal.
+
+With `show_thinking`, reasoning is printed dimmed (when colored) before the reply,
+instead of a single `[thinking]` line. Chat Completions providers return it as
+`reasoning_content`; on the Responses API Hark requests reasoning summaries
+(`reasoning.summary: auto`), which models without reasoning support may reject.
 
 When the provider reports token usage and the context window is known, the prompt
 shows how full the context is, as in `12% > `. The figure is the latest request's
@@ -297,6 +324,7 @@ current configuration. No shell evaluates these values.
 | `system_files` | Files of additional trusted system instructions, appended in order (a missing file is an error) |
 | `instruction_files` | Project files such as `AGENTS.md`, given to the model when present (see below) |
 | `no_line_edit`, `stream` | Booleans: plain terminal input (default `false`), and showing replies as they arrive (default `true`) |
+| `color`, `markdown`, `show_thinking` | Presentation; see Color, Markdown and thinking |
 
 `/model`, `/speed`, `/thinking`, `/approval` and `/review-model` are convenient
 commands for their respective settings. Use `/include`, `/import` and `/prompt`
@@ -677,7 +705,7 @@ allow/deny precedence, reviewer errors, Decisions, compaction, malformed batches
 SSE completion (including metadata-only Codex completion events), context-limit recovery, replay rejection, round limits, and a
 mocked device-login / OAuth refresh flow, model discovery without an initial model,
 runtime setting changes, unconditional approval, rc persistence, streamed replies (live
-text, reassembled tool calls, truncated streams), and background jobs
+text, reassembled tool calls, truncated streams), color/Markdown/thinking presentation, and background jobs
 (parallel runs, agent timeouts, kill, listing, argument checks, and cleanup at exit).
 Persistence tests cover all rc configuration keys, precedence, the read-only startup file,
 context/prompt imports, exports, safe transcript continuation, concurrent sessions,

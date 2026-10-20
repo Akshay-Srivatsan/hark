@@ -656,6 +656,71 @@ def test_context_usage():
         server.shutdown(); server.server_close()
 
 
+def test_presentation():
+    md = 'Intro with `code`.\n\n| a | bb |\n|---|---:|\n| long cell | 1 |\n\n```\nraw *x*\n```'
+    def handle(path, body, headers):
+        history = body['input']
+        if history[-1].get('type') == 'function_call_output':
+            return 200, response('done'), False
+        if history[-1]['content'] == 'tools':
+            return 200, response(calls=[('ok', json.dumps({'command': 'true'})), ('bad', json.dumps({'command': 'exit 3'}))]), False
+        if history[-1]['content'] == 'inject':
+            return 200, response('red \x1b[31mtext\x1b[0m and \u009b31m'), False
+        return 200, response(md), False
+    # Defaults: no escapes, even with NO_COLOR unset; auto is off in a pipe.
+    for flags in ([], ['--color=auto', '--markdown=tty']):
+        p, _, _ = run(handle, ['--approval', 'allow', *flags], prompt='tools')
+        assert p.returncode == 0 and '\x1b' not in p.stdout and '$ true\n[exit 0]\n' in p.stdout, p.stdout
+    # always colors tool lines and outcomes; NO_COLOR does not override always.
+    p, _, _ = run(handle, ['--approval', 'allow', '--color'], prompt='tools', env={'NO_COLOR': '1'})
+    assert '\x1b[1;36m$ true\x1b[0m' in p.stdout and '\x1b[32m[exit 0]\x1b[0m' in p.stdout and '\x1b[31m[exit 3]\x1b[0m' in p.stdout, repr(p.stdout)
+    # Every spelling of the three states, via flags and /set; bad values are errors.
+    for value, colored in (('yes', True), ('force', True), ('no', False), ('none', False), ('tty', False), ('if-tty', False)):
+        p, _, _ = run(handle, ['--approval', 'allow'], prompt=None, stdin=f'/set color {value}\ntools\n/set color\n')
+        assert ('\x1b[' in p.stdout) == colored and ('"always"' if colored else ('"never"' if value in ('no', 'none') else '"auto"')) in p.stdout, (value, p.stdout)
+    p, _, _ = run(handle, ['--color=sometimes'])
+    assert p.returncode == 1 and '--color takes always, never or auto' in p.stderr
+    # Markdown without color only adds spacing: aligned tables, indented code.
+    p, _, _ = run(handle, ['--markdown'], prompt='md')
+    # Columns are at least three wide, as a delimiter row needs three dashes.
+    assert 'Intro with `code`.\n\n| a         |  bb |\n| --------- | --: |\n| long cell |   1 |\n\n```\n' in p.stdout and '\n    raw *x*\n' in p.stdout and '\x1b' not in p.stdout, p.stdout
+    # Hark's escapes never come from model text: injected ones are still escaped.
+    p, _, _ = run(handle, ['--color', '--markdown'], prompt='inject')
+    assert '\\x1b[31mtext' in p.stdout and '\x1b[31mtext' not in p.stdout and '\x9b' not in p.stdout, repr(p.stdout)
+    for chat in (False, True):
+        # Streamed Markdown is rendered a line at a time; tables wait for their last row.
+        def streamed(body):
+            pieces = ['Intro ', 'with `code`.\n\n| a | bb |\n|---|', '---:|\n| long cell | 1 |\n', '\ndone']
+            if chat:
+                return [chat_chunk({'reasoning_content': 'pondering '}), chat_chunk({'reasoning_content': 'deeply'})] + \
+                       [chat_chunk({'content': x}) for x in pieces] + [chat_chunk(finish='stop'), b'data: [DONE]\n\n']
+            if body.get('reasoning', {}).get('summary') == 'auto':
+                head = [sse({'type': 'response.reasoning_summary_text.delta', 'delta': 'pondering deeply'})]
+            else:
+                head = []
+            return head + [sse({'type': 'response.output_text.delta', 'delta': x}) for x in pieces] + responses_text(''.join(pieces))
+        server = stream_server(streamed)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                p = subprocess.run(stream_args(server, chat, '--markdown', '--show-thinking', '--', 'go'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=20)
+                assert p.returncode == 0, p.stderr
+                assert p.stdout.startswith('pondering deeply\n\nIntro with `code`.\n\n| a         |  bb |\n'), repr(p.stdout)
+                assert p.stdout.endswith('| long cell |   1 |\n\ndone\n') and '[thinking]' not in p.stdout, repr(p.stdout)
+                if not chat:
+                    assert server.requests[0]['reasoning'] == {'summary': 'auto'}
+                p = subprocess.run(stream_args(server, chat, '--', 'go'), cwd=tmp, env=stream_env(tmp), capture_output=True, text=True, timeout=20)
+                assert 'pondering' not in p.stdout and 'reasoning' not in server.requests[-1], (p.stdout, server.requests[-1])
+                assert ('[thinking]\n' in p.stdout) == chat
+        finally:
+            server.shutdown(); server.server_close()
+    # Complete (unstreamed) replies show their reasoning too.
+    def thought(path, body, headers):
+        r = response('answer', chat=True); r['choices'][0]['message']['reasoning_content'] = 'because'
+        return 200, r, False
+    p, _, _ = run(thought, ['--api', 'chat', '--no-stream', '--show-thinking'])
+    assert p.stdout.startswith('because\n\nanswer\n'), repr(p.stdout)
+
+
 def test_device_auth():
     import base64
     import shlex
@@ -747,7 +812,7 @@ def test_device_auth():
             root = pathlib.Path(__file__).resolve().parent.parent
             binary = str(pathlib.Path(tmp) / 'hark-auth-test')
             compiler = shlex.split(os.environ.get('CC', 'cc'))
-            cmd = [*compiler, '-std=c99', '-O0', '-DHARK_AUTH_ISSUER="' + origin + '"', '-DHARK_CHATGPT_BASE="' + origin + '/backend"', '-DHARK_OPENAI_BASE="' + origin + '/v1"', '-o', binary, 'hark.c', 'auth.c', 'json.c', 'net.c', 'platform.c', 'line.c', 'store.c', 'session.c', 'yyjson.o', 'isocline.o', '-lcurl']
+            cmd = [*compiler, '-std=c99', '-O0', '-DHARK_AUTH_ISSUER="' + origin + '"', '-DHARK_CHATGPT_BASE="' + origin + '/backend"', '-DHARK_OPENAI_BASE="' + origin + '/v1"', '-o', binary, 'hark.c', 'auth.c', 'json.c', 'net.c', 'platform.c', 'line.c', 'store.c', 'session.c', 'render.c', 'yyjson.o', 'isocline.o', '-lcurl']
             subprocess.run(cmd, cwd=root, check=True, env={**os.environ, 'CCACHE_DISABLE': '1'}, capture_output=True)
             auth = pathlib.Path(tmp) / 'credentials.json'
             clean_env = {k: v for k, v in os.environ.items() if not k.startswith('XDG_') and k not in ('HARK_MODEL', 'HARK_API', 'HARK_API_KEY', 'HARK_BASE_URL', 'OPENAI_API_KEY', 'HARK_SPEED', 'HARK_THINKING', 'HARK_CODEX_CLIENT_VERSION')}
@@ -794,7 +859,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_presentation, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

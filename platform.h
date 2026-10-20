@@ -21,6 +21,8 @@ unsigned long host_pid(void);
 char *host_cwd(void);
 int host_chdir(const char *path);
 int host_tty(void);
+int host_stdout_tty(void);
+void host_enable_ansi(void); /* Windows consoles need this for ANSI escapes. */
 void host_sleep(unsigned seconds);
 double host_seconds(void); /* Monotonic where available; for measuring intervals. */
 /* While armed, ^C sets a flag instead of terminating Hark: requests, shell

@@ -7,6 +7,7 @@
 #include "line.h"
 #include "store.h"
 #include "session.h"
+#include "render.h"
 #include <curl/curl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,6 +46,7 @@ typedef struct {
     size_t ncontext, ninclude, ninstruction, nsystem;
     size_t compact_bytes, output_bytes; unsigned steps, shell_timeout; unsigned long context_window;
     int chatgpt, review_set, review_base_set, review_api_set, list_models, no_line_edit, chatgpt_explicit, resume, no_session, stream;
+    int color, markdown, show_thinking; /* MODE_* for the first two */
 } Config;
 /* General guidance, replaceable with /set system. */
 static const char default_guidance[] =
@@ -165,7 +167,8 @@ static char *preload(int argc, char **argv, char **rc_path) {
         if (a[0] != '-') break;
         if (!strcmp(a, "--help") || !strcmp(a, "-h") || !strcmp(a, "--version")) { skip = 1; break; }
         if (!strcmp(a, "--no-rc")) { disabled = 1; continue; }
-        if (!strcmp(a, "--chatgpt") || !strcmp(a, "--no-line-edit") || !strcmp(a, "--list-models") || !strcmp(a, "--no-session") || !strcmp(a, "--no-stream")) continue;
+        if (!strcmp(a, "--chatgpt") || !strcmp(a, "--no-line-edit") || !strcmp(a, "--list-models") || !strcmp(a, "--no-session") || !strcmp(a, "--no-stream") || !strcmp(a, "--show-thinking")) continue;
+        if (!strncmp(a, "--color", 7) || !strncmp(a, "--markdown", 10)) continue; /* Values use =. */
         if (i + 1 == argc) break;
         if (!strcmp(a, "--cwd")) directory = argv[i + 1];
         if (!strcmp(a, "--rc")) file = argv[i + 1];
@@ -217,6 +220,9 @@ static void usage(void) {
          "  --system-file PATH     Append trusted instructions from file (repeatable)\n"
          "  --no-line-edit         Use plain terminal input\n"
          "  --no-stream            Show replies when complete instead of as they arrive\n"
+         "  --color[=WHEN]         Color output: always (default for --color), never, or auto (a terminal)\n"
+         "  --markdown[=WHEN]      Lay out replies as Markdown: always, never, or auto\n"
+         "  --show-thinking        Show the model's reasoning, when the provider returns it\n"
          "  --rc PATH              Startup Hark input file (default $XDG_CONFIG_HOME/hark/harkrc)\n"
          "  --no-rc                Ignore the rc file\n"
          "  --no-session           Do not save this conversation for hark resume\n"
@@ -233,7 +239,7 @@ static void validate_config(const Json *saved) {
     static const char *const keys[] = {
         "version", "base_url", "api", "model", "speed", "thinking", "key_env", "chatgpt",
         "codex_client_version", "http_timeout", "shell", "approval", "policy", "system_files", "system", "instruction_files",
-        "no_line_edit", "stream", "compact_bytes", "output_bytes", "max_steps", "shell_timeout", "context_window",
+        "no_line_edit", "stream", "color", "markdown", "show_thinking", "compact_bytes", "output_bytes", "max_steps", "shell_timeout", "context_window",
         "review_model", "review_base_url", "review_api", "review_key_env", "auth_file",
         "cwd", "allow", "deny",
         "history", "latest_user", NULL
@@ -255,6 +261,9 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
     c->key_env = saved_text(saved, "key_env", NULL); saved_rules(saved, "system_files", c->system_files, &c->nsystem);
     c->system = saved_text(saved, "system", NULL); saved_rules(saved, "instruction_files", c->instruction_files, &c->ninstruction);
     c->no_line_edit = saved_bool(saved, "no_line_edit", 0); c->stream = saved_bool(saved, "stream", 1);
+    c->show_thinking = saved_bool(saved, "show_thinking", 0);
+    if ((c->color = render_mode(saved_text(saved, "color", "never"))) < 0) die("color must be always/yes/force, never/no/none, or auto/tty/if-tty");
+    if ((c->markdown = render_mode(saved_text(saved, "markdown", "never"))) < 0) die("markdown must be always/yes/force, never/no/none, or auto/tty/if-tty");
     c->chatgpt = saved_bool(saved, "chatgpt", 0);
     if (environment && (getenv("HARK_BASE_URL") || getenv("HARK_API"))) c->chatgpt = 0;
     c->compact_bytes = saved_number(saved, "compact_bytes", 196608, 0, 16UL * 1024UL * 1024UL);
@@ -282,6 +291,16 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
         if (!strcmp(arg, "--list-models")) { c->list_models = 1; continue; }
         if (!strcmp(arg, "--no-line-edit")) { c->no_line_edit = 1; continue; }
         if (!strcmp(arg, "--no-stream")) { c->stream = 0; continue; }
+        if (!strcmp(arg, "--show-thinking")) { c->show_thinking = 1; continue; }
+        /* Like ls: --color alone means always; --color=WHEN picks. */
+        if (!strncmp(arg, "--color", 7) && (!arg[7] || arg[7] == '=')) {
+            if ((c->color = arg[7] ? render_mode(arg + 8) : MODE_ALWAYS) < 0) die("--color takes always, never or auto");
+            continue;
+        }
+        if (!strncmp(arg, "--markdown", 10) && (!arg[10] || arg[10] == '=')) {
+            if ((c->markdown = arg[10] ? render_mode(arg + 11) : MODE_ALWAYS) < 0) die("--markdown takes always, never or auto");
+            continue;
+        }
         if (!strcmp(arg, "--no-session")) { c->no_session = 1; continue; }
         if (!strcmp(arg, "--no-rc")) continue;
         if (!strcmp(arg, "--chatgpt")) { c->chatgpt = c->chatgpt_explicit = 1; continue; }
@@ -501,9 +520,15 @@ static Json *request(Provider *p, const Json *history, const char *instructions,
         const char *tier = !strcmp(p->speed, "standard") ? "default" : !strcmp(p->speed, "fast") ? "priority" : p->speed;
         jset(j, "service_tier", jstr(tier));
     }
-    if (p->thinking && strcmp(p->thinking, "default")) {
+    if ((p->thinking && strcmp(p->thinking, "default")) || (tools && tools->show_thinking && p->api == 0)) {
         if (p->api == 1) jset(j, "reasoning_effort", jstr(p->thinking));
-        else { Json *reasoning = jnew(J_OBJ); jset(reasoning, "effort", jstr(p->thinking)); jset(j, "reasoning", reasoning); }
+        else {
+            Json *reasoning = jnew(J_OBJ);
+            if (p->thinking && strcmp(p->thinking, "default")) jset(reasoning, "effort", jstr(p->thinking));
+            /* Responses returns reasoning text only as summaries, and only when asked. */
+            if (tools && tools->show_thinking) jset(reasoning, "summary", jstr("auto"));
+            jset(j, "reasoning", reasoning);
+        }
     }
     /* Everything that varies comes last, so providers can reuse the cached prefix. */
     if (p->api == 1) {
@@ -517,14 +542,11 @@ static Json *request(Provider *p, const Json *history, const char *instructions,
     if (tools) jset(j, "tools", tool_schemas(tools, p->api == 1));
     return j;
 }
-/* Live display of a streamed reply: text deltas print as they arrive. Each delta
- * is a whole JSON string (the parser rejects invalid UTF-8), so host_print sees
- * complete characters. Reasoning is not shown, only "[thinking]" once. */
-typedef struct { int chat, text, thinking; char last; } Live;
-static void live_print(Live *l, const char *s) {
-    if (!*s) return;
-    host_print(s); l->text = 1; l->last = s[strlen(s) - 1];
-}
+/* Live display of a streamed reply: text deltas go to the renderer as they
+ * arrive. Each delta is a whole JSON string (the parser rejects invalid UTF-8), so
+ * host_print sees complete characters. Reasoning is shown with show_thinking;
+ * otherwise "[thinking]" appears once. */
+typedef struct { int chat, show_thinking, text, thinking; } Live;
 static int live_event(const char *data, void *ctx) {
     Live *l = ctx; Json *e = jparse(data), *text = NULL, *reasoning = NULL;
     if (e && e->type == J_OBJ && l->chat) {
@@ -534,12 +556,16 @@ static int live_event(const char *data, void *ctx) {
         if (jis(e, "type", "response.output_text.delta") || jis(e, "type", "response.refusal.delta")) text = jget(e, "delta");
         else if (jis(e, "type", "response.reasoning_summary_text.delta") || jis(e, "type", "response.reasoning_text.delta")) reasoning = jget(e, "delta");
     }
-    if (reasoning && reasoning->type == J_STR && *reasoning->s && !l->text && !l->thinking) { puts("[thinking]"); fflush(stdout); l->thinking = 1; }
-    if (text && text->type == J_STR) live_print(l, text->s);
+    if (reasoning && reasoning->type == J_STR && *reasoning->s && !l->text) {
+        if (l->show_thinking) render_thinking(reasoning->s);
+        else if (!l->thinking) { render_style(STYLE_THINKING); fputs("[thinking]", stdout); render_reset(); puts(""); fflush(stdout); }
+        l->thinking = 1;
+    }
+    if (text && text->type == J_STR && *text->s) { render_text(text->s); l->text = 1; }
     jfree(e); return 1;
 }
 static void live_end(Live *l) {
-    if (l->text && l->last != '\n') puts("");
+    if (l->text || (l->thinking && l->show_thinking)) render_end();
     fflush(stdout);
 }
 static Json *send_request(Provider *p, Json *req, int *context_error, Live *live) {
@@ -570,6 +596,22 @@ static Json *send_request(Provider *p, Json *req, int *context_error, Live *live
 /* LIVE, when given, streams the reply to the terminal; other requests stay quiet. */
 static Json *generate(Provider *p, const Json *h, const char *sys, const Config *tools, int *ctx, Live *live) {
     Json *req = request(p, h, sys, tools, live != NULL), *r = send_request(p, req, ctx, live); jfree(req); return r;
+}
+/* Reasoning a complete reply carries: Chat reasoning_content, or Responses summaries. */
+static char *reasoning_text(const Json *r, int chat) {
+    Json *v, *part; char *s = xstrdup(""); size_t n = 0;
+    if (chat) {
+        Json *choices = jget(r, "choices"), *msg = jget(choices ? choices->child : NULL, "message"), *t = jget(msg, "reasoning_content");
+        if (!t) t = jget(msg, "reasoning");
+        if (t && t->type == J_STR) { free(s); return xstrdup(t->s); }
+        return s;
+    }
+    for (v = jget(r, "output") ? jget(r, "output")->child : NULL; v; v = v->next) if (jis(v, "type", "reasoning")) {
+        Json *summary = jget(v, "summary");
+        for (part = summary && summary->type == J_ARR ? summary->child : NULL; part; part = part->next)
+            if (jget(part, "text") && jget(part, "text")->type == J_STR) { append_text(&s, &n, n ? "\n\n" : ""); append_text(&s, &n, jget(part, "text")->s); }
+    }
+    return s;
 }
 static char *response_text(const Json *r, int chat) {
     Json *v, *part, *out; char *s = xstrdup(""); size_t n = 0;
@@ -743,8 +785,11 @@ static void job_outcome(Job *j, char *buf, size_t n) {
     else snprintf(buf, n, "exit %d%s", status, truncated ? ", output truncated" : "");
 }
 static void show_job(size_t i, const char *prefix) {
-    char outcome[64]; job_outcome(&jobs[i], outcome, sizeof outcome);
-    printf("[%sjob %lu: %s] ", prefix, (unsigned long)i + 1, outcome); host_print(jobs[i].command); puts("");
+    char outcome[64]; const char *state; int status, timed, truncated, killed;
+    job_outcome(&jobs[i], outcome, sizeof outcome); state = job_state(&jobs[i]);
+    (void)host_job_result(jobs[i].job, &status, &timed, &truncated, &killed);
+    render_style(!strcmp(state, "running") ? STYLE_JOB : !strcmp(state, "exited") && status == 0 ? STYLE_OK : !strcmp(state, "exited") ? STYLE_FAIL : STYLE_WARN);
+    printf("[%sjob %lu: %s]", prefix, (unsigned long)i + 1, outcome); render_reset(); putchar(' '); host_print(jobs[i].command); puts("");
     if (strcmp(job_state(&jobs[i]), "running")) jobs[i].shown = 1;
 }
 /* Tell the user about jobs that finished while nobody was waiting for them. */
@@ -797,7 +842,7 @@ static void shell_tool(Config *c, const Json *j, Json *res, const char *latest, 
     if (!background) timeout = timeout && timeout < c->shell_timeout ? timeout : c->shell_timeout;
     else if (!timeout) timeout = JOB_TIMEOUT;
     if (background && (njobs == MAX_JOBS || running_jobs() >= MAX_RUNNING)) { jset(res, "error", jstr("too many background jobs; wait for or kill some first")); return; }
-    fputs("\n$ ", stdout); host_print(cmd->s); puts(background ? " &" : "");
+    putchar('\n'); render_style(STYLE_COMMAND); fputs("$ ", stdout); host_print(cmd->s); fputs(background ? " &" : "", stdout); render_reset(); putchar('\n');
     if (!approve(c, cmd->s, latest, history)) {
         if (host_interrupted()) { jset(res, "error", jstr("interrupted by the user; command not run")); jset(res, "interrupted", jbool(1)); }
         else { jset(res, "error", jstr("command denied by approval policy; do not bypass this denial")); jset(res, "denied", jbool(1)); }
@@ -805,16 +850,23 @@ static void shell_tool(Config *c, const Json *j, Json *res, const char *latest, 
     }
     if (background) {
         Job *job = &jobs[njobs];
-        if (!(job->job = host_job_start(c->shell, cmd->s, (unsigned)timeout, c->output_bytes))) { puts("[could not start job]"); jset(res, "error", jstr("cannot start background job")); return; }
+        if (!(job->job = host_job_start(c->shell, cmd->s, (unsigned)timeout, c->output_bytes))) {
+            render_style(STYLE_FAIL); fputs("[could not start job]", stdout); render_reset(); putchar('\n');
+            jset(res, "error", jstr("cannot start background job")); return;
+        }
         job->command = xstrdup(cmd->s); job->start = time(NULL); job->end = 0; job->timeout = timeout; job->shown = job->delivered = 0; njobs++;
-        printf("[job %lu started]\n", (unsigned long)njobs); fflush(stdout);
+        render_style(STYLE_JOB); printf("[job %lu started]", (unsigned long)njobs); render_reset(); putchar('\n'); fflush(stdout);
         jset(res, "job_id", jnum((unsigned long)njobs)); jset(res, "state", jstr("running")); jset(res, "timeout_seconds", jnum(timeout));
         return;
     }
     out = host_run(c->shell, cmd->s, (unsigned)timeout, c->output_bytes, &st, &timed, &truncated);
     /* Show only the outcome; the model still receives the full output. */
-    if (st < 0) { fputs("[shell failed: ", stdout); host_print(out); puts("]"); }
-    else printf("[exit %d%s%s]\n", st, timed ? ", timed out" : host_interrupted() ? ", interrupted" : "", truncated ? ", output truncated" : "");
+    if (st < 0) { render_style(STYLE_FAIL); fputs("[shell failed: ", stdout); host_print(out); fputs("]", stdout); }
+    else {
+        render_style(timed || host_interrupted() ? STYLE_WARN : st ? STYLE_FAIL : STYLE_OK);
+        printf("[exit %d%s%s]", st, timed ? ", timed out" : host_interrupted() ? ", interrupted" : "", truncated ? ", output truncated" : "");
+    }
+    render_reset(); putchar('\n');
     fflush(stdout);
     jset(res, "output", jstr(out)); free(out);
     if (st >= 0) jset(res, "exit_status", jnum((unsigned long)st)); else jset(res, "exit_status", jnew(J_NULL));
@@ -827,7 +879,8 @@ static void list_tool(const Json *j, Json *res) {
     if (!known_args(j, names)) { jset(res, "error", jstr("job_list takes no arguments")); return; }
     arr = jnew(J_ARR); for (i = 0; i < njobs; i++) jadd(arr, job_json(i, 0));
     jset(res, "jobs", arr); running = running_jobs();
-    printf("\n[jobs: %lu running, %lu finished]\n", (unsigned long)running, (unsigned long)(njobs - running)); fflush(stdout);
+    putchar('\n'); render_style(STYLE_NOTE); printf("[jobs: %lu running, %lu finished]", (unsigned long)running, (unsigned long)(njobs - running));
+    render_reset(); putchar('\n'); fflush(stdout);
 }
 static void wait_tool(Config *c, const Json *j, Json *res) {
     static const char *const names[] = {"ids", "timeout", NULL};
@@ -844,9 +897,9 @@ static void wait_tool(Config *c, const Json *j, Json *res) {
     }
     else for (i = 0; i < njobs; i++) if (!job_done(&jobs[i]) || !jobs[i].delivered) list[n++] = i;
     if (!n) { jset(res, "jobs", jnew(J_ARR)); jset(res, "note", jstr("no running jobs or unreturned results")); return; }
-    printf("\n[waiting up to %lus for job", timeout);
+    putchar('\n'); render_style(STYLE_NOTE); printf("[waiting up to %lus for job", timeout);
     for (i = 0; i < n; i++) printf("%s %lu", i ? "," : (n > 1 ? "s" : ""), (unsigned long)list[i] + 1);
-    puts("]"); fflush(stdout);
+    fputs("]", stdout); render_reset(); putchar('\n'); fflush(stdout);
     deadline = host_seconds() + (double)timeout;
     for (i = 0; i < n && !host_interrupted(); i++) {
         double left = deadline - host_seconds();
@@ -916,7 +969,8 @@ static Json *configuration(const Config *c) {
     a = jnew(J_ARR); for (i = 0; i < c->ninstruction; i++) jadd(a, jstr(c->instruction_files[i])); jset(j, "instruction_files", a);
     if (c->review_base_set) put_text(j, "review_base_url", c->review.base);
     if (c->review_api_set) put_text(j, "review_api", api_name(c->review.api));
-    jset(j, "no_line_edit", jbool(c->no_line_edit)); jset(j, "stream", jbool(c->stream));
+    jset(j, "no_line_edit", jbool(c->no_line_edit)); jset(j, "stream", jbool(c->stream)); jset(j, "show_thinking", jbool(c->show_thinking));
+    put_text(j, "color", render_mode_name(c->color)); put_text(j, "markdown", render_mode_name(c->markdown));
     jset(j, "http_timeout", jnum(c->main.timeout)); jset(j, "shell_timeout", jnum(c->shell_timeout));
     jset(j, "compact_bytes", jnum((unsigned long)c->compact_bytes)); jset(j, "output_bytes", jnum((unsigned long)c->output_bytes)); jset(j, "max_steps", jnum(c->steps)); jset(j, "context_window", jnum(c->context_window));
     a = jnew(J_ARR); for (i = 0; i < c->nallow; i++) jadd(a, jstr(c->allow[i])); jset(j, "allow", a);
@@ -960,7 +1014,7 @@ static int turn(Config *c, Json **h, const char *sys, const char *latest) {
         sync_instructions(c, *h); /* Changes, e.g. the agent editing AGENTS.md, are appended. */
         checkpoint(c, *h, latest); /* The request so far, and each completed tool round. */
         if (c->compact_bytes) { char *s = jdump(*h); size_t n = strlen(s); free(s); if (n >= c->compact_bytes && !compact(c, h, latest, sys)) return 0; }
-        memset(&live, 0, sizeof live); live.chat = chat;
+        memset(&live, 0, sizeof live); live.chat = chat; live.show_thinking = c->show_thinking;
         r = generate(&c->main, *h, sys, c, &ctx, c->stream ? &live : NULL);
         if (!r) { if (host_interrupted()) return 0; if (ctx && !retried_context && c->compact_bytes && compact(c, h, latest, sys)) { retried_context = 1; continue; } return 0; }
         if (!complete(r, chat)) { fputs("incomplete model response; no commands executed\n", stderr); jfree(r); return 0; }
@@ -969,7 +1023,15 @@ static int turn(Config *c, Json **h, const char *sys, const char *latest) {
         else items = jget(r, "output");
         if (!validate_calls(items, *h, chat)) { fputs("invalid tool-call batch; no commands executed\n", stderr); jfree(r); return 0; }
         /* A streamed reply is already on screen. */
-        text = response_text(r, chat); has_text = *text != 0; if (*text && !live.text) { host_print(text); puts(""); } free(text);
+        text = response_text(r, chat); has_text = *text != 0;
+        if (!live.text && !live.thinking) { /* Not streamed: show it now. */
+            char *thought = c->show_thinking ? reasoning_text(r, chat) : xstrdup("");
+            if (*thought) render_thinking(thought);
+            if (*text) render_text(text);
+            if (*thought || *text) render_end();
+            free(thought);
+        }
+        free(text);
         if (chat) jadd(*h, jcopy(msg)); else for (v = items->child; v; v = v->next) jadd(*h, jcopy(v));
         for (v = items ? items->child : NULL; v; v = v->next) {
             Json *f, *result; char *output;
@@ -1162,7 +1224,7 @@ static int set_option(Config *c, Json **owned, Json *history, char **sys, char *
     if (!strcmp(key, "cwd") || !strcmp(key, "shell") || !strcmp(key, "system_files") || !strcmp(key, "system")) {
         char *text = system_text(&next); free(*sys); *sys = text;
     }
-    *c = next; jfree(*owned); *owned = j; return 1;
+    *c = next; jfree(*owned); *owned = j; render_setup(c->color, c->markdown); return 1;
 }
 static void repl_help(void) {
     puts("/models                 List provider models\n"
@@ -1194,6 +1256,7 @@ int main(int argc, char **argv) {
     options(&c, argc, argv, &login, NULL, 1); c.rc_file = rc_path;
     list_on_start = c.list_models; c.list_models = 0;
     if (curl_global_init(CURL_GLOBAL_DEFAULT)) die("cannot initialize libcurl");
+    render_setup(c.color, c.markdown);
     host_interrupt_arm();
     if (!c.auth_file) {
         path = user_file(HOST_DATA, "auth.json", ".hark-auth.json"); c.auth_file = path;
@@ -1232,7 +1295,7 @@ int main(int argc, char **argv) {
                     { char brief[84]; const char *text = latest ? latest : "(none)"; size_t n = strcspn(text, "\r\n");
                       if (n > 80) n = 77;
                       memcpy(brief, text, n); strcpy(brief + n, n < strlen(text) ? "..." : "");
-                      fputs("[resumed session; last request: ", stdout); host_print(brief); puts("]"); }
+                      render_style(STYLE_NOTE); fputs("[resumed session; last request: ", stdout); host_print(brief); fputs("]", stdout); render_reset(); putchar('\n'); }
                 }
                 for (i = 0; i < ncontext; i++) if (!import_file(&c, history, &latest, contexts[i])) die("cannot import context file");
                 if (initial_prompt_file) { file_prompt = store_text(initial_prompt_file, INPUT_LIMIT); if (!file_prompt) die("cannot read prompt file"); initial_prompt = file_prompt; }

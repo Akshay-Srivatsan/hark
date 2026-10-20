@@ -12,20 +12,21 @@ LDLIBS = -lcurl
 ISOCLINE_CFLAGS = -Wno-unused-function
 PREFIX = /usr/local
 
-OBJ = hark.o json.o net.o auth.o platform.o line.o store.o session.o yyjson.o isocline.o
+OBJ = hark.o json.o net.o auth.o platform.o line.o store.o session.o render.o yyjson.o isocline.o
 
 all: hark
 
 hark: $(OBJ)
 	$(CC) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
 
-hark.o: hark.c json.h net.h auth.h platform.h line.h store.h session.h
+hark.o: hark.c json.h net.h auth.h platform.h line.h store.h session.h render.h
 json.o: json.c json.h vendor/yyjson/yyjson.h
 net.o: net.c net.h json.h
 auth.o: auth.c auth.h net.h json.h platform.h
 platform.o: platform.c platform.h json.h
 store.o: store.c store.h platform.h json.h
 session.o: session.c session.h store.h platform.h json.h
+render.o: render.c render.h platform.h json.h
 line.o: line.c line.h vendor/isocline/include/isocline.h
 
 .c.o:
