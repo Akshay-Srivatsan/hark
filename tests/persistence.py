@@ -172,10 +172,20 @@ def test_per_user_rc():
         root = pathlib.Path(temp)
         home, project = root / 'home', root / 'project'
         home.mkdir(); project.mkdir()
-        startup(home).write_text('config model user\n')
         (project / '.harkrc').write_text('config model project\nconfig approval deny\n')
         def invoke(*args, text='/status\n/quit\n', directory=project, env=None):
             return subprocess.run([BINARY, *args], cwd=directory, input=text, text=True, capture_output=True, env=env or environment(home), timeout=10)
+        fallback = home / '.harkrc'
+        fallback.write_text('config model fallback\n')
+        p = good(invoke())
+        assert 'model: fallback' in p.stdout and str(fallback) in p.stdout
+        p = good(invoke(env={**environment(home), 'XDG_CONFIG_HOME': str(root / 'xdg')}))
+        assert 'model: fallback' in p.stdout
+        p = good(invoke('--no-rc'))
+        assert 'model: fallback' not in p.stdout
+        p = good(invoke('--rc', 'missing.rc'))
+        assert 'model: fallback' not in p.stdout
+        startup(home).write_text('config model user\n')
         # The user startup script runs from any directory; a project .harkrc does not run on its own.
         p = good(invoke())
         assert 'model: user' in p.stdout and 'project' not in p.stdout and str(startup(home)) in p.stdout
@@ -193,6 +203,10 @@ def test_per_user_rc():
         env = {k: v for k, v in environment(home).items() if k not in ('HOME', 'USERPROFILE')}
         p = good(invoke(env=env))
         assert 'model: user' not in p.stdout and 'model: project' not in p.stdout
+        startup(home).write_text('unknown_command\n')
+        assert invoke().returncode == 1
+        startup(home).chmod(0o666)
+        assert invoke().returncode == 1
 
 
 def session_key(directory):
@@ -268,10 +282,10 @@ def test_resume():
             assert (xdg / 'hark/sessions' / session_key(project) / 'latest').exists() and not (root / 'xdg-data').exists()
             good(invoke(*provider, '--', 'relative', extra_env={'XDG_STATE_HOME': 'relative'}))
             assert not (project / 'relative').exists()
-            # A legacy file is not read implicitly.
+            # ~/.harkrc is used only when the XDG startup file is absent.
             (home / '.harkrc').write_text('config model legacy\n')
             p = good(invoke(text='/status\n/quit\n'))
-            assert 'model: legacy' not in p.stdout
+            assert 'model: legacy' in p.stdout
             (home / '.config/hark').mkdir(parents=True, exist_ok=True)
             (home / '.config/hark/harkrc').write_text('config model xdg\n')
             p = good(invoke(text='/status\n/quit\n'))
@@ -563,12 +577,28 @@ array set hark {speed fast approval deny}
         script = r'''
 /config model model-two
 /set hark(model) model-three
+/if {[config model] ne "model-three"} {error {config did not read the native variable}}
+/if {[config thinking] ne "high"} {error {config did not read the startup setting}}
+/if {[config http_timeout] != 300} {error {config did not read the numeric default}}
+/if {[config stream] ne "true"} {error {config did not read the boolean default}}
+/if {[config review_model] ne {}} {error {config did not read an empty override}}
+/config base_url http://127.0.0.1:8080/v1
+/config base_url {}
+/if {[config base_url] ne "https://api.openai.com/v1"} {error {config did not reset base_url}}
+/set hark(base_url) http://127.0.0.1:8080/v1
+/set hark(base_url) {}
+/if {[config base_url] ne "https://api.openai.com/v1"} {error {native set did not reset base_url}}
+/if {![catch {config base_url ftp://example.org}]} {error {invalid URL accepted}}
+/if {[config base_url] ne "https://api.openai.com/v1"} {error {invalid URL changed base_url}}
+/config thinking
 /config policy {λ😀 $literal [error should-not-run]; text}
 /lappend hark(allow) {git status --short}
+/if {[config allow] ne {{git status --short}}} {error {config did not read the list}}
 /if {![catch {set hark(http_timeout) 0} message]} {error {invalid write accepted}}
 /puts $message
 /if {$hark(http_timeout) != 300} {error {invalid write changed the variable}}
 /if {![catch {config typo 1}]} {error {unknown setting accepted}}
+/if {![catch {config typo}]} {error {unknown setting read accepted}}
 /if {[info exists hark(typo)]} {error {unknown setting retained}}
 /unset hark
 /set hark(model) model-four
@@ -580,6 +610,7 @@ array set hark {speed fast approval deny}
         p = good(invoke(text=script.lstrip('\n')))
         assert 'model: model-four' in p.stdout and 'thinking: high' in p.stdout, (p.stdout, p.stderr)
         assert 'whole number from 1 to 86400' in p.stdout
+        assert 'high' in p.stdout.splitlines(), p.stdout
         saved = rc_state(root / 'state.tcl')
         assert saved['model'] == 'model-four' and saved['speed'] == 'fast'
         assert saved['allow'] == ['git status --short']
@@ -588,7 +619,7 @@ array set hark {speed fast approval deny}
         p = good(invoke('--no-rc', text='/config review_model pinned\n/source state.tcl\n/save reloaded.tcl\n/quit\n'))
         assert rc_state(root / 'reloaded.tcl') == saved
         # Missing arguments and uncaught script errors stop files before later commands.
-        (root / 'bad.tcl').write_text('config model\nset f [open should-not-exist w]\n')
+        (root / 'bad.tcl').write_text('config model extra extra\nset f [open should-not-exist w]\n')
         p = invoke('--no-rc', '--include', 'bad.tcl')
         assert p.returncode == 1 and 'wrong # args' in p.stderr and not (root / 'should-not-exist').exists()
         # Values with embedded NUL cannot cross the C string boundary.

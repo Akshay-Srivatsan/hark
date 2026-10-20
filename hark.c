@@ -142,6 +142,19 @@ static char *user_file(int kind, const char *name) {
     free(base);
     return path;
 }
+static char *default_rc(void) {
+    char *path = user_file(HOST_CONFIG, "harkrc"), *fallback;
+    const char *home = host_home();
+    if (!home || (path && host_exists(path) != 0)) return path;
+    fallback = xmalloc(strlen(home) + sizeof "/.harkrc");
+    sprintf(fallback, "%s/.harkrc", home);
+    if (host_exists(fallback) != 0) {
+        free(path);
+        return fallback;
+    }
+    free(fallback);
+    return path;
+}
 /* Select --cwd and --rc without interpreting option values or prompt text. */
 static char *preload(int argc, char **argv, char **rc_path) {
     const char *directory = NULL, *file = NULL; int i, disabled = 0, skip = 0, ok; char *saved = NULL;
@@ -163,7 +176,7 @@ static char *preload(int argc, char **argv, char **rc_path) {
     if (!skip && directory && host_chdir(directory)) die("cannot change working directory");
     /* The startup file is per-user. Project scripts run only when explicitly sourced. */
     if (file) *rc_path = absolute_path(file);
-    else *rc_path = user_file(HOST_CONFIG, "harkrc");
+    else *rc_path = default_rc();
     if (!*rc_path) { *rc_path = xstrdup("(none: no home directory)"); disabled = 1; }
     if (!skip && !disabled) { saved = store_read(*rc_path, &ok); if (!ok) die("use --no-rc to ignore harkrc"); }
     return saved;
@@ -1296,6 +1309,7 @@ static int set_option(Config *c, Json **owned, Json *history, char **sys,
         found = 1;
     }
     if (!found) { problem = "unknown setting"; goto failed; }
+    if (!strcmp(key, "base_url") && !*text) next.main.base = OPENAI_BASE;
     if (!strcmp(key, "review_model")) next.review_set = next.review.model != NULL;
     if (!strcmp(key, "review_base_url")) next.review_base_set = next.review.base != NULL;
     if (!strcmp(key, "base_url") || !strcmp(key, "api") || !strcmp(key, "key_env")) {
@@ -1424,7 +1438,7 @@ static void show_status(Commands *cmd) {
 static void repl_help(void) {
     puts("Prefix terminal scripts with /; rc files contain Tcl without the prefix.\n"
          "set hark(KEY) VALUE  Change a setting; omit VALUE to read it\n"
-         "config KEY VALUE     Set the same variable\n"
+         "config KEY ?VALUE?   Read or write the same variable\n"
          "array get hark       List settings\n"
          "models               List provider models\n"
          "status               Show settings and context usage\n"
@@ -1473,8 +1487,14 @@ static int command_impl(ClientData data, Tcl_Interp *interp, int argc, Tcl_Obj *
     if (cmd->quit) return TCL_ERROR;
     if (!strcmp(name, "config")) {
         Tcl_Obj *value;
-        if (argc != 3) { Tcl_WrongNumArgs(interp, 1, argv, "key value"); return TCL_ERROR; }
-        value = Tcl_SetVar2Ex(interp, "hark", arg, argv[2], TCL_GLOBAL_ONLY | TCL_LEAVE_ERR_MSG);
+        if (argc != 2 && argc != 3) {
+            Tcl_WrongNumArgs(interp, 1, argv, "key ?value?");
+            return TCL_ERROR;
+        }
+        if (argc == 2)
+            value = Tcl_GetVar2Ex(interp, "hark", arg, TCL_GLOBAL_ONLY | TCL_LEAVE_ERR_MSG);
+        else
+            value = Tcl_SetVar2Ex(interp, "hark", arg, argv[2], TCL_GLOBAL_ONLY | TCL_LEAVE_ERR_MSG);
         if (!value) return TCL_ERROR;
         Tcl_SetObjResult(interp, value);
         return TCL_OK;

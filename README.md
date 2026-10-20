@@ -98,7 +98,9 @@ source personal-settings.tcl
 prompt {Inspect src/parser.c and fix its error handling.}
 ```
 
-`config KEY VALUE` is equivalent to `set hark(KEY) VALUE`. Both validate the
+`config KEY` returns the current value, like `set hark(KEY)`; at the terminal,
+`/config KEY` prints it. `config KEY VALUE` is equivalent to
+`set hark(KEY) VALUE`. Both forms of assignment validate the
 setting immediately. Invalid writes restore the previous value and raise a Tcl
 error. Read a setting with `set hark(KEY)` and list settings with `array get hark`.
 Values are canonicalized after assignment: booleans become `true`/`false`, and
@@ -113,7 +115,7 @@ process status nonzero.
 
 | Command | Effect |
 | --- | --- |
-| `config KEY VALUE` | Write `hark(KEY)` |
+| `config KEY ?VALUE?` | Read or write `hark(KEY)` |
 | `models` | List provider models |
 | `status` | Show active settings, startup path and context usage |
 | `prompt TEXT` | Submit one literal string to the model |
@@ -154,7 +156,10 @@ Project-local startup files are never loaded automatically.
 
 Relative XDG variables are ignored. Windows defaults are `%APPDATA%\hark` for
 configuration and `%LOCALAPPDATA%\hark` for data, with `state` and `cache`
-subdirectories. `~/.harkrc` and `~/.hark-auth.json` are not implicit fallback paths.
+subdirectories. If the XDG startup file is absent, Hark falls back to `~/.harkrc`.
+Only one startup file runs; an unsafe or invalid XDG file is an error.
+`--rc FILE` selects that file directly, and `--no-rc` skips both paths.
+There is no implicit fallback to `~/.hark-auth.json` for credentials.
 Without a home directory, provide explicit startup/credential paths as needed.
 
 `--cwd` changes directory before startup. Paths in scripts are relative to the
@@ -201,7 +206,9 @@ and add `--`; exceptions are noted below. `hark --help` lists startup flags.
 | `show_thinking` | `false` |
 
 Boolean settings use Tcl boolean values. List settings use Tcl lists. Empty values
-clear optional reviewer, key, system and file/directory overrides. Model/provider
+clear optional reviewer, key, system and file/directory overrides.
+`config base_url {}` restores `https://api.openai.com/v1`.
+Model/provider
 changes retain visible history but discard opaque reasoning. Changing the wire
 API requires `reset` when history is nonempty. Selecting a custom base/API/key
 turns off ChatGPT mode. Reviewer keys are inherited only for the same base URL.

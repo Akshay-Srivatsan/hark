@@ -42,8 +42,9 @@ helpers and data tables where they remove repetition. Do not edit `vendor/`.
 are Tcl scripts. Ordinary terminal input and the `prompt` command submit text;
 model responses and imported files are never evaluated as Tcl.
 
-`set hark(key) value` and `config key value` share one array trace. Convert Tcl
-values at this boundary; lists and booleans use Tcl's types. `set_option` copies
+`set hark(key) value` and `config key value` share one array trace. `config key`
+reads the same variable and returns its current value. Convert Tcl values at
+this boundary; lists and booleans use Tcl's types. `set_option` copies
 the current C configuration, updates the affected field, validates the candidate,
 and commits it. Failed writes must preserve both the variable and C state,
 working directory, system prompt and history. Accepted values are owned by the
