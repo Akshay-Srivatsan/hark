@@ -219,14 +219,25 @@ def test_approval_commands():
     assert p.returncode == 0 and files['result'] == 'done', p.stderr
 
 
+def is_compaction(history):
+    return history[-1].get('role') == 'user' and history[-1].get('content', '').startswith('Summarize this coding conversation')
+
+
 def test_compact():
     for chat in (False, True):
         n = 0
+        seen = []
         def handle(path, body, headers):
             nonlocal n
             history = body['messages' if chat else 'input']
-            if 'tools' not in body:
-                assert 'Summarize' in (history[0]['content'] if chat else body['instructions'])
+            seen.append(body)
+            if is_compaction(history):
+                # Compaction extends the previous request, so the cached prefix is reused:
+                # same system prompt and tools, earlier messages unchanged, the ask appended.
+                prev = seen[-2]
+                assert body['tools'] == prev['tools'] and body.get('instructions') == prev.get('instructions')
+                prev_history = prev['messages' if chat else 'input']
+                assert history[:len(prev_history)] == prev_history and len(history) > len(prev_history) + 1
                 assert 'payload' in json.dumps(history)
                 return 200, response('Task still pending; inspection completed.', chat=chat), False
             n += 1
@@ -284,7 +295,7 @@ def test_context_retry():
         if n == 2:
             return 400, {'error': {'code': 'context_length_exceeded'}}, False
         if n == 3:
-            assert 'tools' not in body
+            assert is_compaction(body['input']) and 'tools' in body
             return 200, response('Prior result retained.'), False
         assert body['input'][-1]['content'] == 'second request'
         return 200, response('recovered'), False

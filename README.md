@@ -276,7 +276,9 @@ current configuration. No shell evaluates these values.
 | `review_model`, `review_base_url`, `review_api`, `review_key_env` | Reviewer overrides; `review_model default` follows the agent |
 | `cwd`, `shell`, `shell_timeout` | Working directory, shell executable and execution timeout in seconds |
 | `output_bytes`, `compact_bytes`, `max_steps` | Tool-output limit, compaction threshold (`0` disables), maximum rounds per turn |
-| `system_file` | File of additional trusted system instructions |
+| `system` | General guidance at the start of the system prompt (replaces the built-in guidance; `default` restores it) |
+| `system_files` | Files of additional trusted system instructions, appended in order (a missing file is an error) |
+| `instruction_files` | Project files such as `AGENTS.md`, given to the model when present (see below) |
 | `no_line_edit` | Boolean, default `false` |
 
 `/model`, `/speed`, `/thinking`, `/approval` and `/review-model` are convenient
@@ -319,7 +321,47 @@ For example, including a file containing `/approval allow` changes the approval
 mode. Importing that same file adds the literal text `/approval allow` to history
 and leaves the approval mode unchanged. `/prompt` likewise submits slash-prefixed
 text literally. Additional trusted model instructions belong in
-`/set system_file instructions.txt` or `--system-file`.
+`/set system_files ["instructions.txt"]` or `--system-file`.
+
+### System prompt and project instructions
+
+The system prompt is your guidance, then rules Hark always includes (approval,
+fresh shells, background jobs, untrusted tool output), then the working directory
+and shell, then any `system_files`. `/set system TEXT` replaces the guidance, which
+defaults to a short description of a careful coding agent:
+
+```text
+/set system You are reviewing code. Prefer small, well-tested changes.
+/set system default
+```
+
+Project instruction files are opt-in. Add this to your `harkrc` to use `AGENTS.md`
+or `CLAUDE.md` in whatever directory Hark runs in:
+
+```text
+/set instruction_files ["AGENTS.md", "CLAUDE.md"]
+```
+
+Each listed file that exists is read relative to the working directory, and missing
+ones are skipped. Because a checkout may be untrusted, their contents reach the model
+as a user message, not the system prompt, labeled as project instructions that do
+not override the system rules or approval. Hark prints `[loaded AGENTS.md]` when it
+adds them. They are added before the first prompt and re-checked before every
+request. When a file changes (for example, after the agent edits it), the new
+version is appended to the conversation rather than replacing the earlier one, and
+removing the files is noted the same way. Resumed sessions are not given a duplicate,
+and compaction keeps the current version.
+
+### Prompt caching
+
+Requests are ordered for provider prompt caching: the system prompt and tool
+definitions come first and change only when you change a setting they include
+(`/set system`, `system_files`, `cwd`, `shell`, `shell_timeout`), and the
+conversation only grows at the end. Instruction-file changes are appended. Compaction
+sends the normal system prompt, tools and full conversation with the summary request
+appended, so that request reuses the cached prefix; the compacted conversation then
+starts with the same system prompt, tools and project instructions. Switching model
+or provider drops opaque reasoning from earlier messages, which changes the prefix.
 
 ```sh
 ./hark --include setup.hark --context-file requirements.txt --prompt-file task.txt
@@ -577,9 +619,11 @@ programs that deliberately escape process groups are outside that guarantee.
 ### Compaction and limits
 
 At a completed tool-round boundary, when serialized history reaches
-`--compact-bytes` (default 196608), the same provider/model summarizes it with tools
-disabled. The replacement contains the summary and the latest user request
-verbatim; old tool-call/result pairs are removed together. Summary replacement is
+`--compact-bytes` (default 196608), the same provider/model summarizes it. The
+summary request is appended to the conversation, with the usual system prompt and
+tools (the model is told not to call them), so it reuses the cached prompt prefix.
+The replacement contains the current project instructions, the summary and the
+latest user request verbatim; old tool-call/result pairs are removed together. Summary replacement is
 atomic in memory: an empty, incomplete, failed or nonshrinking summary leaves the
 original history intact and ends the turn with an error. A summary must also fit
 under the configured threshold. Set `--compact-bytes 0` to disable automatic
@@ -590,8 +634,8 @@ byte heuristic, **not a tokenizer**: choose a threshold comfortably below your
 model's input window, allowing for system instructions, tool schemas and output.
 If even the summarization request exceeds the provider's context limit, the run
 stops; no history is silently dropped. Summarization is lossy, so inspect its
-consequences in important workflows. `--system-file PATH` appends trusted project
-instructions to every normal agent request and is not removed by compaction.
+consequences in important workflows. The system prompt, including `system_files`,
+is never compacted, and project instruction files are re-added after compaction.
 
 `--max-steps` bounds model rounds per user turn (default 100). Reaching it exits
 nonzero even if the last tool succeeded. Other useful controls are `--shell`,

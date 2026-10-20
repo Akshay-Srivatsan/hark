@@ -61,7 +61,7 @@ def test_local():
                       approval='model', policy='Read only unless asked.', allow=['pwd'], deny=['*sudo*'],
                       review_model='pinned', review_base_url='http://127.0.0.1:2/v1',
                       review_api='decisions', review_key_env='REVIEW_KEY',
-                      system_file='system.txt', auth_file='auth.json', cwd='work', no_line_edit=True,
+                      system_files=['system.txt'], auth_file='auth.json', cwd='work', no_line_edit=True,
                       compact_bytes=0, output_bytes=1234, max_steps=9, shell_timeout=3)
         rc.write_text('/set cwd work\n' + rc_script({k:v for k,v in config.items() if k != 'cwd'}) + '/import notes.txt\n'); rc.chmod(0o644)
         before = rc.read_bytes()
@@ -279,6 +279,64 @@ def test_resume():
         server.shutdown(); server.server_close(); thread.join()
 
 
+def test_instructions():
+    bodies = []
+    def handler(path, body, headers):
+        bodies.append(body)
+        users = [v['content'] for v in body['input'] if v.get('role') == 'user']
+        if users[-1] == 'edit' and body['input'][-1].get('type') != 'function_call_output' and not users[-1].startswith('[Project'):
+            return 200, response(calls=[('e', json.dumps({'command': "printf 'Use spaces.' > AGENTS.md"}))]), False
+        return 200, response('ok'), False
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    server.requests, server.errors, server.handler = [], [], handler
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix='hark-instructions-') as temp:
+            root = pathlib.Path(temp).resolve()
+            home, project = root / 'home', root / 'project'
+            home.mkdir(); project.mkdir()
+            env = environment(home)
+            (home / '.harkrc').write_text('/set instruction_files ["AGENTS.md", "CLAUDE.md"]\n/set system Be terse.\n')
+            (project / 'AGENTS.md').write_text('Use tabs.')
+            provider = ['--base-url', f'http://127.0.0.1:{server.server_port}/v1', '--model', 'main', '--key-env', 'TEST_KEY', '--approval', 'allow']
+            def invoke(*args, text=''):
+                return subprocess.run([BINARY, *args], cwd=project, input=text, text=True, capture_output=True, env=env, timeout=15)
+            def instruction_messages(body):
+                return [v['content'] for v in body['input'] if v.get('role') == 'user' and v['content'].startswith('[Project instructions]')]
+            # /set system replaces the general guidance; the fixed rules stay.
+            p = good(invoke(*provider, '--', 'edit'))
+            first, second = bodies[-2], bodies[-1]
+            assert first['instructions'].startswith('Be terse.\n') and 'You are a coding agent' not in first['instructions']
+            assert 'denied requests must be respected' in first['instructions'] and 'Use tabs' not in first['instructions']
+            # Instruction files are a user message before the prompt; missing ones are skipped.
+            assert first['input'][0]['content'].startswith('[Project instructions]') and '# AGENTS.md\n\nUse tabs.' in first['input'][0]['content']
+            assert first['input'][1]['content'] == 'edit' and 'CLAUDE.md' not in first['input'][0]['content']
+            assert '[loaded AGENTS.md]' in p.stderr
+            # An edit to AGENTS.md is appended; the earlier request is an unchanged prefix (cache reuse).
+            assert second['input'][:len(first['input'])] == first['input'], 'the prompt prefix must not change'
+            assert instruction_messages(second)[-1].endswith('Use spaces.') and second['input'][-1]['content'].startswith('[Project instructions]')
+            # Resuming does not duplicate unchanged instructions; removing the files is announced once.
+            good(invoke('resume', *provider, '--', 'again'))
+            assert len(instruction_messages(bodies[-1])) == 2 and bodies[-1]['input'][-1]['content'] == 'again'
+            (project / 'AGENTS.md').unlink()
+            good(invoke('resume', *provider, '--', 'gone'))
+            assert 'No instruction files are present' in instruction_messages(bodies[-1])[-1]
+            good(invoke('resume', *provider, '--', 'still gone'))
+            assert len(instruction_messages(bodies[-1])) == 3
+            # /set system default restores the built-in guidance; system_files are appended in order.
+            (project / 'one.txt').write_text('First file.'); (project / 'two.txt').write_text('Second file.')
+            good(invoke(*provider, '--no-session', text='/set system default\n/set system_files ["one.txt", "two.txt"]\nhello\n/quit\n'))
+            assert bodies[-1]['instructions'].startswith('You are a coding agent') and bodies[-1]['instructions'].endswith('\nFirst file.\nSecond file.')
+            good(invoke(*provider, '--no-session', '--system-file', 'one.txt', '--system-file', 'two.txt', '--', 'flags'))
+            assert bodies[-1]['instructions'].endswith('\nFirst file.\nSecond file.')
+            p = invoke(*provider, '--no-session', '--system-file', 'missing.txt', '--', 'x')
+            assert p.returncode == 1 and 'cannot read system file' in p.stderr
+        assert not server.errors, server.errors
+    finally:
+        server.shutdown(); server.server_close(); thread.join()
+
+
 def test_include_import():
     with tempfile.TemporaryDirectory(prefix='hark-include-') as temp:
         root = pathlib.Path(temp)
@@ -411,6 +469,8 @@ if __name__ == '__main__':
     print('per-user harkrc tests passed')
     test_resume()
     print('resume tests passed')
+    test_instructions()
+    print('instruction file tests passed')
     test_include_import()
     print('include/import distinction tests passed')
     test_concurrent_saves()
