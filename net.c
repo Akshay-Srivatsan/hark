@@ -212,7 +212,7 @@ bad:
  * rebuilt into the nonstreaming shape; without a finish_reason the response
  * stays incomplete, so no tool runs. */
 #define CHAT_CALLS 64
-typedef struct { char *content, *reasoning, *finish; size_t ncontent, nreasoning; Json *calls[CHAT_CALLS]; size_t ncalls; } ChatStream;
+typedef struct { char *content, *reasoning, *finish; size_t ncontent, nreasoning; Json *calls[CHAT_CALLS], *usage; size_t ncalls; } ChatStream;
 static void append(char **s, size_t *n, const char *part) {
     size_t k = strlen(part); *s = xrealloc(*s, *n + k + 1); memcpy(*s + *n, part, k + 1); *n += k;
 }
@@ -224,6 +224,8 @@ static int chat_event(const char *data, void *ctx) {
     if (!*data || !strcmp(data, "[DONE]")) return 1;
     chunk = jparse(data);
     if (!chunk || chunk->type != J_OBJ || (jget(chunk, "error") && jget(chunk, "error")->type != J_NULL)) { jfree(chunk); return 0; }
+    /* Usage usually arrives in a final chunk with no choices. */
+    if ((v = jget(chunk, "usage")) && v->type == J_OBJ) { jfree(c->usage); c->usage = jcopy(v); }
     choices = jget(chunk, "choices"); choice = choices && choices->type == J_ARR ? choices->child : NULL;
     delta = jget(choice, "delta");
     if ((v = jget(delta, "content")) && v->type == J_STR) append(&c->content, &c->ncontent, v->s);
@@ -253,7 +255,7 @@ Json *chat_response_json(const char *s) {
     sse_feed(&e, s, strlen(s));
     if (!sse_finish(&e) || (!c.ncontent && !c.ncalls && !c.finish)) {
         for (i = 0; i < c.ncalls; i++) jfree(c.calls[i]);
-        free(c.content); free(c.reasoning); free(c.finish); return NULL;
+        jfree(c.usage); free(c.content); free(c.reasoning); free(c.finish); return NULL;
     }
     msg = jnew(J_OBJ); jset(msg, "role", jstr("assistant"));
     jset(msg, "content", c.ncontent || !c.ncalls ? jstr(c.content ? c.content : "") : jnew(J_NULL));
@@ -262,6 +264,6 @@ Json *chat_response_json(const char *s) {
     choice = jnew(J_OBJ); jset(choice, "index", jnum(0)); jset(choice, "message", msg);
     jset(choice, "finish_reason", c.finish ? jstr(c.finish) : jnew(J_NULL));
     choices = jnew(J_ARR); jadd(choices, choice);
-    result = jnew(J_OBJ); jset(result, "choices", choices);
+    result = jnew(J_OBJ); jset(result, "choices", choices); if (c.usage) jset(result, "usage", c.usage);
     free(c.content); free(c.reasoning); free(c.finish); return result;
 }

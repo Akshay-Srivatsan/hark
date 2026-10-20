@@ -19,7 +19,7 @@ static bool entire_line(const char *s, long len) { (void)s; return len > 0; }
 static void complete(ic_completion_env_t *env, const char *prefix) {
     if (*prefix == '/') ic_complete_word(env, prefix, complete_commands, entire_line);
 }
-char *line_read(void) {
+char *line_read(const char *prompt) {
     static int initialized; char *s;
     if (!initialized) {
         ic_set_history(NULL, 200); /* Session memory only: never save prompts. */
@@ -30,7 +30,7 @@ char *line_read(void) {
         ic_enable_brace_insertion(false); ic_enable_inline_help(false);
         initialized = 1;
     }
-    s = ic_readline("");
+    s = ic_readline(prompt);
     if (s && !*s && feof(stdin)) { free(s); return NULL; }
     return s;
 }

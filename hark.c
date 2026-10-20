@@ -43,7 +43,7 @@ typedef struct {
     const char *directory, *system, *rc_file, *prompt_file;
     const char *context_files[MAX_RULES], *include_files[MAX_RULES], *instruction_files[MAX_RULES], *system_files[MAX_RULES];
     size_t ncontext, ninclude, ninstruction, nsystem;
-    size_t compact_bytes, output_bytes; unsigned steps, shell_timeout;
+    size_t compact_bytes, output_bytes; unsigned steps, shell_timeout; unsigned long context_window;
     int chatgpt, review_set, review_base_set, review_api_set, list_models, no_line_edit, chatgpt_explicit, resume, no_session, stream;
 } Config;
 /* General guidance, replaceable with /set system. */
@@ -212,6 +212,7 @@ static void usage(void) {
          "  --output-bytes N       Max retained bytes per shell call (default 65536)\n"
          "  --compact-bytes N      Compact at serialized history size (default 196608; 0 off)\n"
          "  --max-steps N          Max model rounds per user turn (default 100)\n"
+         "  --context-window N     Model context size in tokens, for the prompt's usage figure\n"
          "  --http-timeout SEC     Default 300\n"
          "  --system-file PATH     Append trusted instructions from file (repeatable)\n"
          "  --no-line-edit         Use plain terminal input\n"
@@ -232,7 +233,7 @@ static void validate_config(const Json *saved) {
     static const char *const keys[] = {
         "version", "base_url", "api", "model", "speed", "thinking", "key_env", "chatgpt",
         "codex_client_version", "http_timeout", "shell", "approval", "policy", "system_files", "system", "instruction_files",
-        "no_line_edit", "stream", "compact_bytes", "output_bytes", "max_steps", "shell_timeout",
+        "no_line_edit", "stream", "compact_bytes", "output_bytes", "max_steps", "shell_timeout", "context_window",
         "review_model", "review_base_url", "review_api", "review_key_env", "auth_file",
         "cwd", "allow", "deny",
         "history", "latest_user", NULL
@@ -260,6 +261,7 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
     c->output_bytes = saved_number(saved, "output_bytes", 65536, 1, INPUT_LIMIT);
     c->steps = (unsigned)saved_number(saved, "max_steps", 100, 1, 100000);
     c->shell_timeout = (unsigned)saved_number(saved, "shell_timeout", 120, 1, 86400);
+    c->context_window = saved_number(saved, "context_window", 0, 0, 100000000UL);
     c->review.model = saved_text(saved, "review_model", NULL); c->review_set = c->review.model != NULL && strcmp(c->review.model, "default");
     c->review.base = saved_text(saved, "review_base_url", NULL); c->review_base_set = c->review.base != NULL;
     if (jget(saved, "review_api")) { c->review.api = api_type(saved_text(saved, "review_api", "responses")); c->review_api_set = 1; }
@@ -314,6 +316,7 @@ static void options(Config *c, int argc, char **argv, int *login, const Json *sa
         else if (!strcmp(arg, "--output-bytes")) c->output_bytes = number(v, 1, INPUT_LIMIT);
         else if (!strcmp(arg, "--compact-bytes")) c->compact_bytes = number(v, 0, 16UL * 1024UL * 1024UL);
         else if (!strcmp(arg, "--max-steps")) c->steps = (unsigned)number(v, 1, 100000);
+        else if (!strcmp(arg, "--context-window")) c->context_window = number(v, 0, 100000000UL);
         else if (!strcmp(arg, "--http-timeout")) c->main.timeout = (unsigned)number(v, 1, 86400);
         else if (!strcmp(arg, "--system-file")) { if (c->nsystem == MAX_RULES) die("too many system files"); c->system_files[c->nsystem++] = v; }
         else die("unknown option (see --help)");
@@ -362,6 +365,8 @@ static char *endpoint(const Provider *p) {
 static int compare_ids(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
+/* Credentials are present for a request that must not print anything. */
+static int provider_ready_quiet(const Provider *p) { return p->auth || !same_base(p->base, OPENAI_BASE) || (p->key && *p->key); }
 static int provider_ready(const Provider *p) {
     if (!p->auth && same_base(p->base, OPENAI_BASE) && (!p->key || !*p->key)) {
         fputs("OpenAI credentials missing: set OPENAI_API_KEY (or HARK_API_KEY), or run hark login for ChatGPT access.\n", stderr);
@@ -379,10 +384,9 @@ static void authentication_error(const Provider *p, const Http *r) {
         if (same_base(p->base, OPENAI_BASE)) fputs("ChatGPT device-login tokens require --chatgpt; they are not OpenAI API keys.\n", stderr);
     }
 }
-static int list_models(Provider *p) {
-    char *url;
-    Http r; Json *j = NULL, *models, *v; const char **ids; size_t n = 0, i; int attempt;
-    if (!provider_ready(p)) return 0;
+/* The provider's model list; QUIET skips error messages (for background lookups). */
+static Json *fetch_models(Provider *p, int quiet) {
+    char *url; Http r; Json *j = NULL; int attempt;
     if (p->auth) {
         char suffix[96]; snprintf(suffix, sizeof suffix, "/models?client_version=%s", p->catalog_version);
         url = provider_url(p, suffix);
@@ -391,9 +395,15 @@ static int list_models(Provider *p) {
         if (p->auth && !auth_refresh(p->auth, 0)) break;
         r = http_get(url, p->auth ? auth_key(p->auth) : p->key, p->auth ? auth_account(p->auth) : NULL, p->timeout);
         if (r.status == 401 && p->auth && !attempt) { http_free(&r); if (auth_refresh(p->auth, 1)) continue; break; }
-        authentication_error(p, &r); j = http_json(&r, p->auth ? auth_key(p->auth) : p->key); http_free(&r); break;
+        if (quiet) { j = http_ok(&r) ? jparse(r.body) : NULL; if (j && j->type != J_OBJ) { jfree(j); j = NULL; } }
+        else { authentication_error(p, &r); j = http_json(&r, p->auth ? auth_key(p->auth) : p->key); }
+        http_free(&r); break;
     }
-    free(url); if (!j) return 0;
+    free(url); return j;
+}
+static int list_models(Provider *p) {
+    Json *j, *models, *v; const char **ids; size_t n = 0, i;
+    if (!provider_ready(p) || !(j = fetch_models(p, 0))) return 0;
     models = jget(j, p->auth ? "models" : "data");
     if (!models || models->type != J_ARR) { fputs("invalid model-list response: expected an array\n", stderr); jfree(j); return 0; }
     for (v = models->child; v; v = v->next) {
@@ -409,6 +419,38 @@ static int list_models(Provider *p) {
         else fputs("provider returned no models\n", stderr);
     }
     free(ids); jfree(j); return n || !p->auth;
+}
+/* Context usage for the prompt: tokens used by the latest main request, out of
+ * the model's context window (the context_window setting, else the provider's
+ * model list, looked up once per provider and model). 0 means unknown. */
+static unsigned long context_used;
+static unsigned long usage_number(const Json *v) { return v && v->type == J_NUM && v->s[0] >= '0' && v->s[0] <= '9' ? strtoul(v->s, NULL, 10) : 0; }
+static void record_usage(const Json *r, int chat) {
+    const Json *u = jget(r, "usage"); unsigned long n = usage_number(jget(u, "total_tokens"));
+    if (!n) n = usage_number(jget(u, chat ? "prompt_tokens" : "input_tokens")) + usage_number(jget(u, chat ? "completion_tokens" : "output_tokens"));
+    if (n) context_used = n;
+}
+static unsigned long context_window(Config *c) {
+    static char *key; static unsigned long cached;
+    static const char *const fields[] = {"context_window", "context_length", "max_context_length", "max_model_len", NULL};
+    char *k; Json *j, *v; size_t i;
+    if (c->context_window) return c->context_window;
+    if (!*c->main.model || !provider_ready_quiet(&c->main)) return 0;
+    k = xmalloc(strlen(c->main.base) + strlen(c->main.model) + 2); sprintf(k, "%s\n%s", c->main.base, c->main.model);
+    if (key && !strcmp(key, k)) { free(k); return cached; }
+    free(key); key = k; cached = 0;
+    j = fetch_models(&c->main, 1);
+    for (v = jget(j, c->main.auth ? "models" : "data"), v = v && v->type == J_ARR ? v->child : NULL; v && !cached; v = v->next) {
+        if (strcmp(jtext(jget(v, c->main.auth ? "slug" : "id")), c->main.model)) continue;
+        for (i = 0; fields[i] && !cached; i++) cached = usage_number(jget(v, fields[i]));
+    }
+    jfree(j); return cached;
+}
+/* "12% " for the prompt, or "" when either number is unknown. */
+static void context_label(Config *c, char *buf, size_t n) {
+    unsigned long window;
+    buf[0] = 0;
+    if (context_used && (window = context_window(c)) != 0) snprintf(buf, n, "%lu%% ", context_used * 100 / window);
 }
 /* Simple nonrecursive whole-string glob. No platform-specific fnmatch semantics. */
 static int matches(const char *pattern, const char *s) {
@@ -454,6 +496,7 @@ static Json *request(Provider *p, const Json *history, const char *instructions,
     Json *j = jnew(J_OBJ), *arr = jnew(J_ARR), *v;
     /* The ChatGPT backend only streams. */
     jset(j, "model", jstr(p->model)); jset(j, "stream", jbool(p->auth != NULL || stream));
+    if (stream && p->api == 1) jset(j, "stream_options", jparse("{\"include_usage\":true}"));
     if (p->speed && strcmp(p->speed, "auto")) {
         const char *tier = !strcmp(p->speed, "standard") ? "default" : !strcmp(p->speed, "fast") ? "priority" : p->speed;
         jset(j, "service_tier", jstr(tier));
@@ -615,7 +658,7 @@ static int compact(Config *c, Json **history, const char *latest, const char *sy
     jadd(next, message("user", latest)); /* Keep the current user's request verbatim. */
     after = jdump(next);
     if (strlen(after) >= old_size || (c->compact_bytes && strlen(after) >= c->compact_bytes)) { fputs("compaction did not reduce history enough; original retained\n", stderr); free(after); jfree(next); return 0; }
-    free(after); jfree(*history); *history = next; return 1;
+    free(after); jfree(*history); *history = next; context_used = 0; /* Unknown until the next reply. */ return 1;
 }
 static Json *evidence(Config *c, const char *command, const char *latest, const Json *history) {
     Json *j = jnew(J_OBJ); char *cwd = host_cwd();
@@ -875,7 +918,7 @@ static Json *configuration(const Config *c) {
     if (c->review_api_set) put_text(j, "review_api", api_name(c->review.api));
     jset(j, "no_line_edit", jbool(c->no_line_edit)); jset(j, "stream", jbool(c->stream));
     jset(j, "http_timeout", jnum(c->main.timeout)); jset(j, "shell_timeout", jnum(c->shell_timeout));
-    jset(j, "compact_bytes", jnum((unsigned long)c->compact_bytes)); jset(j, "output_bytes", jnum((unsigned long)c->output_bytes)); jset(j, "max_steps", jnum(c->steps));
+    jset(j, "compact_bytes", jnum((unsigned long)c->compact_bytes)); jset(j, "output_bytes", jnum((unsigned long)c->output_bytes)); jset(j, "max_steps", jnum(c->steps)); jset(j, "context_window", jnum(c->context_window));
     a = jnew(J_ARR); for (i = 0; i < c->nallow; i++) jadd(a, jstr(c->allow[i])); jset(j, "allow", a);
     a = jnew(J_ARR); for (i = 0; i < c->ndeny; i++) jadd(a, jstr(c->deny[i])); jset(j, "deny", a);
     put_text(j, "auth_file", c->auth_file);
@@ -921,6 +964,7 @@ static int turn(Config *c, Json **h, const char *sys, const char *latest) {
         r = generate(&c->main, *h, sys, c, &ctx, c->stream ? &live : NULL);
         if (!r) { if (host_interrupted()) return 0; if (ctx && !retried_context && c->compact_bytes && compact(c, h, latest, sys)) { retried_context = 1; continue; } return 0; }
         if (!complete(r, chat)) { fputs("incomplete model response; no commands executed\n", stderr); jfree(r); return 0; }
+        record_usage(r, chat);
         if (chat) { choice = jget(r, "choices")->child; msg = jget(choice, "message"); items = jget(msg, "tool_calls"); if (items && items->type == J_NULL) items = NULL; if (items && items->type != J_ARR) { jfree(r); return 0; } }
         else items = jget(r, "output");
         if (!validate_calls(items, *h, chat)) { fputs("invalid tool-call batch; no commands executed\n", stderr); jfree(r); return 0; }
@@ -1214,8 +1258,9 @@ int main(int argc, char **argv) {
                 if (initial_prompt) break;
                 job_notices();
                 /* Isocline reads ^C as a key (cancel the line) and ^D on an empty line as EOF. */
-                if (interactive && !c.no_line_edit) { puts(""); host_interrupt_disarm(); line = line_read(); host_interrupt_arm(); }
-                else { if (interactive) { fputs("\n> ", stdout); fflush(stdout); } line = read_line(stdin); }
+                char label[32]; context_label(&c, label, sizeof label);
+                if (interactive && !c.no_line_edit) { puts(""); host_interrupt_disarm(); line = line_read(label); host_interrupt_arm(); }
+                else { if (interactive) { printf("\n%s> ", label); fflush(stdout); } line = read_line(stdin); }
             }
             if (!line && host_interrupted()) continue;
             if (!line) break;
@@ -1228,7 +1273,12 @@ int main(int argc, char **argv) {
                 char *value;
                 if (!strcmp(line, "/models")) { if ((!providers(&c, &auth) || !list_models(&c.main)) && !host_interrupted()) ok = 0; free(line); continue; }
                 if (!strcmp(line, "/help")) { repl_help(); free(line); continue; }
-                if (!strcmp(line, "/status")) { setting("model", c.main.model); setting("speed", c.main.speed); setting("thinking", c.main.thinking); setting("approval", c.approval); setting("review-model", c.review_set ? c.review.model : c.main.model); setting("review-model-source", c.review_set ? "explicit" : "current agent model"); setting("harkrc", c.rc_file); free(line); continue; }
+                if (!strcmp(line, "/status")) { setting("model", c.main.model); setting("speed", c.main.speed); setting("thinking", c.main.thinking); setting("approval", c.approval); setting("review-model", c.review_set ? c.review.model : c.main.model); setting("review-model-source", c.review_set ? "explicit" : "current agent model"); setting("harkrc", c.rc_file);
+                    { unsigned long window = context_used ? context_window(&c) : 0; char usage[96];
+                      if (context_used && window) snprintf(usage, sizeof usage, "%lu of %lu tokens (%lu%%)", context_used, window, context_used * 100 / window);
+                      else snprintf(usage, sizeof usage, "%s", context_used ? "window unknown (set context_window)" : "no usage reported yet");
+                      setting("context", usage); }
+                    free(line); continue; }
                 if (!strcmp(line, "/jobs")) {
                     size_t i; if (!njobs) puts("no background jobs");
                     for (i = 0; i < njobs; i++) show_job(i, "");
@@ -1333,7 +1383,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (!strcmp(line, "/quit")) { free(line); break; }
-            if (!strcmp(line, "/reset")) { jfree(history); history = jnew(J_ARR); free(latest); latest = NULL; free(line); continue; }
+            if (!strcmp(line, "/reset")) { jfree(history); history = jnew(J_ARR); free(latest); latest = NULL; context_used = 0; free(line); continue; }
             if (!strcmp(line, "/compact")) { if (latest && (!providers(&c, &auth) || !compact(&c, &history, latest, sys)) && !host_interrupted()) ok = 0; free(line); continue; }
             if (!*line || line[0] == '#') { free(line); continue; }
             if (line[0] == '/') { fputs("unknown command; use /help\n", stderr); free(line); if (from_file) { ok = 0; break; } continue; }

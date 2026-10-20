@@ -621,6 +621,41 @@ def test_streaming():
     assert p.returncode == 0 and 'plain reply' in p.stdout, p.stderr
 
 
+def test_context_usage():
+    def handle(path, body, headers):
+        if path.endswith('/models'):
+            return 200, {'object': 'list', 'data': [{'id': 'other', 'context_length': 5}, {'id': 'main', 'context_length': 1000}]}, False
+        r = response('hi')
+        r['usage'] = {'input_tokens': 200, 'output_tokens': 50, 'total_tokens': 250}
+        return 200, r, False
+    # The window comes from the model list (once); /reset clears the figure.
+    p, req, _ = run(handle, prompt=None, stdin='/status\nhello\n/status\nagain\n/status\n/reset\n/status\n')
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.count('context: no usage reported yet') == 2 and p.stdout.count('context: 250 of 1000 tokens (25%)') == 2, p.stdout
+    assert [r[0] for r in req].count('/v1/models') == 1
+    # A context_window setting overrides the lookup; without either, /status says so.
+    p, req, _ = run(handle, ['--context-window', '500'], prompt=None, stdin='hello\n/status\n')
+    assert 'context: 250 of 500 tokens (50%)' in p.stdout and '/v1/models' not in [r[0] for r in req], p.stdout
+    def no_window(path, body, headers):
+        if path.endswith('/models'):
+            return 200, {'object': 'list', 'data': [{'id': 'main'}]}, False
+        return handle(path, body, headers)
+    p, _, _ = run(no_window, prompt=None, stdin='hello\n/status\n')
+    assert 'context: window unknown (set context_window)' in p.stdout, p.stdout
+    # Chat streams ask for usage, which arrives in a final chunk without choices.
+    def chat(body):
+        assert body['stream_options'] == {'include_usage': True}
+        return [chat_chunk({'content': 'hi'}), chat_chunk(finish='stop'),
+                sse({'object': 'chat.completion.chunk', 'choices': [], 'usage': {'prompt_tokens': 90, 'completion_tokens': 10}}), b'data: [DONE]\n\n']
+    server = stream_server(chat)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = subprocess.run(stream_args(server, True, '--context-window', '400'), cwd=tmp, env=stream_env(tmp), input='hello\n/status\n', capture_output=True, text=True, timeout=20)
+            assert p.returncode == 0 and 'context: 100 of 400 tokens (25%)' in p.stdout, (p.stdout, p.stderr)
+    finally:
+        server.shutdown(); server.server_close()
+
+
 def test_device_auth():
     import base64
     import shlex
@@ -759,7 +794,7 @@ def test_device_auth():
 
 
 if __name__ == '__main__':
-    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_device_auth):
+    for test in (test_tools, test_reviews, test_approval_commands, test_compact, test_invalid_batches, test_context_retry, test_no_retry_side_effects, test_isolation_and_limit, test_replay_rejected, test_models, test_settings, test_provider_errors, test_jobs, test_streaming, test_context_usage, test_device_auth):
         test()
         print(test.__name__, 'passed')
     print('integration tests passed')

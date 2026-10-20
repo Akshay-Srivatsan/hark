@@ -138,6 +138,15 @@ Commands from `.harkrc` or `--include` files still pending are skipped. With
 `--no-line-edit`, Ctrl-C at the prompt discards the partial line and Ctrl-D on an
 empty line exits. In a one-shot or piped run, Ctrl-C stops Hark with exit status 130.
 
+When the provider reports token usage and the context window is known, the prompt
+shows how full the context is, as in `12% > `. The figure is the latest request's
+tokens (input plus output) out of the model's window. The window comes from the
+`context_window` setting (`--context-window N`), or else from the provider's model
+list (fields such as `context_window`, `context_length` or `max_model_len`), looked up
+once per provider and model. `/status` shows the token counts. Compaction and
+`/reset` clear the figure until the next reply. Chat streams request usage with
+`stream_options`.
+
 The most recent 200 input lines are retained in memory only; no history file is
 written. `--no-line-edit` selects plain terminal input. Piped input always uses
 plain stdio, and approval answers are kept out of the editor history. This is a
@@ -282,6 +291,7 @@ current configuration. No shell evaluates these values.
 | `approval`, `allow`, `deny`, `policy` | Approval mode, arrays of command globs, and additional reviewer policy |
 | `review_model`, `review_base_url`, `review_api`, `review_key_env` | Reviewer overrides; `review_model default` follows the agent |
 | `cwd`, `shell`, `shell_timeout` | Working directory, shell executable and execution timeout in seconds |
+| `context_window` | Model context size in tokens for the prompt's usage figure (`0`: ask the provider) |
 | `output_bytes`, `compact_bytes`, `max_steps` | Tool-output limit, compaction threshold (`0` disables), maximum rounds per turn |
 | `system` | General guidance at the start of the system prompt (replaces the built-in guidance; `default` restores it) |
 | `system_files` | Files of additional trusted system instructions, appended in order (a missing file is an error) |
